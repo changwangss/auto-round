@@ -491,7 +491,10 @@ class DiffusionMixin:
             logger.warning("could not find blocks, exit with original model")
             return self.model_context.model, self.quantizer.layer_config
 
-        if not self.has_variable_block_shape:
+        calibration_block_selector = getattr(self, "get_calibration_block_names", None)
+        if calibration_block_selector is not None:
+            to_cache_block_names = calibration_block_selector(all_blocks)
+        elif not self.has_variable_block_shape:
             to_cache_block_names = [block[0] for block in all_blocks]
         else:
             to_cache_block_names = flatten_list(all_blocks)
@@ -641,7 +644,7 @@ class DiffusionMixin:
     def save_quantized(
         self,
         output_dir: Optional[str] = None,
-        format: Union[str, list] = "auto_round",
+        format: Union[str, list, None] = None,
         inplace: bool = True,
         return_folders: bool = False,
         **kwargs,
@@ -652,7 +655,7 @@ class DiffusionMixin:
 
         Args:
             output_dir (str, optional): The directory to save the quantized model. Defaults to None.
-            format (str, optional): The format in which to save the model. Defaults to "auto_round".
+            format (str, optional): The format in which to save the model. Defaults to the compressor format.
             inplace (bool, optional): Whether to modify the model in place. Defaults to True.
             return_folders (bool, optional): Whether to return the save folder paths. Defaults to False.
             **kwargs: Additional keyword arguments specific to the export format.
@@ -672,7 +675,7 @@ class DiffusionMixin:
         has_multiple_quantized_transformers = bool(quantized_transformers)
 
         # Handle multi-format (convert string to list if needed)
-        _format = format
+        _format = self.formats if format is None else format
         if isinstance(_format, str):
             from auto_round.formats import get_formats
 

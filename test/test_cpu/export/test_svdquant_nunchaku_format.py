@@ -183,6 +183,48 @@ def test_diffusion_save_exports_self_contained_nunchaku_pipeline(tmp_path):
     assert model_index["transformer"] == ["nunchaku", "NunchakuFluxTransformer2dModel"]
 
 
+def test_diffusion_save_uses_compressor_format_when_argument_is_omitted(tmp_path):
+    from auto_round.compressors.diffusion_mixin import DiffusionMixin
+
+    class Transformer(torch.nn.Module):
+        config = {"_class_name": "FluxTransformer2DModel"}
+
+    quantized_transformer = Transformer()
+
+    class Pipeline:
+        transformer = quantized_transformer
+        components = {"transformer": quantized_transformer}
+
+        def save_config(self, output_dir):
+            Path(output_dir, "model_index.json").write_text(
+                json.dumps({"transformer": ["diffusers", "FluxTransformer2DModel"]}), encoding="utf-8"
+            )
+
+    class ExportParent:
+        def save_quantized(self, output_dir, **kwargs):
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            save_file(
+                {"probe": torch.zeros(1)},
+                f"{output_dir}/diffusion_pytorch_model.safetensors",
+                metadata={"model_class": "NunchakuFluxTransformer2dModel"},
+            )
+            return self.model_context.model
+
+    class Compressor(DiffusionMixin, ExportParent):
+        pass
+
+    compressor = Compressor.__new__(Compressor)
+    compressor.formats = [SimpleNamespace(format_name="svdquant_nunchaku")]
+    compressor.model_context = SimpleNamespace(pipe=Pipeline(), model=quantized_transformer)
+    compressor.compress_context = SimpleNamespace(is_immediate_saving=False)
+
+    compressor.save_quantized(tmp_path)
+
+    assert (tmp_path / "transformer" / "config.json").is_file()
+    model_index = json.loads((tmp_path / "model_index.json").read_text(encoding="utf-8"))
+    assert model_index["transformer"] == ["nunchaku", "NunchakuFluxTransformer2dModel"]
+
+
 def test_svdquant_nunchaku_resolves_flux_adapter_name(monkeypatch, tmp_path):
     import auto_round.export.svdquant_nunchaku as exporter
     from auto_round.export.svdquant_adapters.flux import FluxSVDQuantNunchakuAdapter

@@ -1,5 +1,7 @@
 """Fast unit tests for algorithm registry and pipeline construction."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ from auto_round.algorithms.pipeline import DiffusionBlockIO, QuantizationPipelin
 from auto_round.algorithms.quantization import registry as _r
 from auto_round.algorithms.quantization.rtn.quantizer import RTNQuantizer
 from auto_round.compressors.base import collect_user_scheme_overrides
+from auto_round.compressors.calibrated_zero_shot import CalibratedZeroShotCompressor
 from auto_round.compressors.data_driven import DataDrivenCompressor
 from auto_round.compressors.entry import AutoRound as NewAutoRound
 from auto_round.compressors.entry import _select_rtn_compressor_base_cls
@@ -62,6 +65,42 @@ def test_diffusion_block_io_preserves_single_sample_tensor_batch_dimension():
     _, input_others = io._select_inputs(io._fp_inputs, io._input_others, torch.tensor([0]))
 
     assert input_others["temb"].shape == (1, 32)
+
+
+def test_diffusion_reference_inputs_preserve_flux_dual_streams():
+    class FluxBlock(torch.nn.Module):
+        def forward(self, hidden_states, encoder_hidden_states):
+            return encoder_hidden_states + 1, hidden_states + 2
+
+    class Quantizer:
+        batch_size = 1
+        model_context = SimpleNamespace(amp=False, amp_dtype=torch.float32)
+        compress_context = SimpleNamespace(cache_device="cpu", clear_memory=lambda: None)
+
+        @staticmethod
+        def _resolve_block_forward():
+            def run(block, hidden_states, input_others, *_args):
+                input_others = dict(input_others)
+                input_others.pop("positional_inputs", None)
+                return block(hidden_states, **input_others)
+
+            return run
+
+    io = DiffusionBlockIO(
+        _fp_inputs={
+            "encoder_hidden_states": [torch.tensor([[10.0]])],
+            "hidden_states": [torch.tensor([[20.0]])],
+        },
+        _input_others={"positional_inputs": []},
+        _quantizer=Quantizer(),
+        _block=FluxBlock(),
+        output_config=["encoder_hidden_states", "hidden_states"],
+    )
+
+    outputs = io.collect_reference_inputs()
+
+    torch.testing.assert_close(outputs["encoder_hidden_states"][0], torch.tensor([[11.0]]))
+    torch.testing.assert_close(outputs["hidden_states"][0], torch.tensor([[22.0]]))
 
 
 def test_pipeline_duplicate_preprocessor_rejected():
@@ -214,6 +253,77 @@ def test_data_free_svdquant_rtn_routes_to_zero_shot(monkeypatch):
 
     assert isinstance(result, ZeroShotCompressor)
     assert captured["config"][0].requires_calibration is False
+
+
+def test_calibrated_svdquant_rtn_routes_to_calibrated_zero_shot(monkeypatch):
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    captured = {}
+
+    def _fake_init(self, config, **kwargs):
+        captured["config"] = config
+
+    monkeypatch.setattr(CalibratedZeroShotCompressor, "__init__", _fake_init)
+    monkeypatch.setattr("auto_round.utils.model.detect_model_type", lambda *args, **kwargs: "llm")
+
+    result = NewAutoRound(
+        "dummy-model",
+        "MXFP4",
+        [SVDQuantConfig(smooth_enabled=True), RTNConfig(disable_opt_rtn=True)],
+        format="svdquant_nunchaku",
+    )
+
+    assert isinstance(result, CalibratedZeroShotCompressor)
+    assert isinstance(result, ZeroShotCompressor)
+    assert not isinstance(result, DataDrivenCompressor)
+    assert captured["config"][0].requires_calibration is True
+
+
+def test_calibrated_zero_shot_collects_reference_before_rtn_without_propagation():
+    events = []
+
+    class Preprocessor:
+        def pre_quantize_block(self, ctx):
+            events.append("transform")
+
+        def post_quantize_block(self, ctx):
+            events.append("cleanup")
+
+    class Quantizer:
+        def quantize_block(self, ctx):
+            events.append("rtn")
+
+    class Pipeline:
+        preprocessors = [Preprocessor()]
+
+        def enter_preprocessor_hooks(self, ctx, stack):
+            events.append("hooks")
+
+    class Context:
+        def collect_reference_inputs(self, stack):
+            events.append("reference")
+            return [torch.zeros(1)]
+
+        def collect_next_inputs(self):
+            raise AssertionError("calibrated zero-shot must not propagate quantized block outputs")
+
+    compressor = CalibratedZeroShotCompressor.__new__(CalibratedZeroShotCompressor)
+    compressor._pipeline = Pipeline()
+    compressor.quantizer = Quantizer()
+    compressor._current_input_others = {}
+
+    compressor._run_block_pipeline(Context())
+
+    assert events == ["hooks", "reference", "transform", "rtn", "cleanup"]
+
+
+def test_calibrated_zero_shot_caches_only_each_block_group_entry():
+    blocks = [["blocks.0", "blocks.1"], ["single_blocks.0", "single_blocks.1"]]
+
+    assert CalibratedZeroShotCompressor.get_calibration_block_names(blocks) == [
+        "blocks.0",
+        "single_blocks.0",
+    ]
 
 
 def test_entry_warns_and_drops_unsupported_kwargs(monkeypatch, tiny_opt_model_path):

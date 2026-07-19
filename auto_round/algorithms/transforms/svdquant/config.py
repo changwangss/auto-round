@@ -71,6 +71,7 @@ class SVDQuantConfig(QuantizationConfig):
         self.residual_early_stop = residual_early_stop
         self.residual_quant_method = residual_quant_method
         self.requires_calibration = smooth_enabled
+        self.calibration_stage = "preprocessor" if smooth_enabled else None
 
     def __repr__(self) -> str:
         return (

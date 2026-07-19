@@ -61,6 +61,58 @@ runtime tensor is `smooth = 1 / scale`. Flux export preserves shared QKV down/sm
 tensors directly, and splits single-stream `proj_out` residual/down/smooth tensors by
 input columns without replacing the selected scale with identity.
 
+### Calibrated Zero-Shot Scheduling
+
+Smoothing needs calibration data, but plain RTN does not become a data-driven optimizer.
+When smoothing is enabled with RTN, `CalibratedZeroShotCompressor` separates the two
+responsibilities:
+
+1. replay the current block with FP calibration inputs and collect smooth-search data;
+2. select and apply the smooth factor, then build the low-rank branch;
+3. invoke the normal zero-shot RTN block quantizer for the residual;
+4. pass only the current block's FP reference output to the next block.
+
+No quantized block output is propagated. SignRound still uses `DataDrivenCompressor`
+because SignRound itself optimizes weights from calibration data. No-smooth RTN remains
+fully data-free and directly uses `ZeroShotCompressor`.
+
+The scheduler is streaming across each block group. It initially caches only the entry
+block inputs, not the inputs of all 57 FLUX blocks. After processing one block, its FP
+reference output becomes the next block's calibration input and the previous block's
+temporary buffers are released. For FLUX.1-dev this changes the initial activation-cache
+count from approximately:
+
+```text
+57 * nsamples * num_inference_steps
+```
+
+to:
+
+```text
+2 block-group entries * nsamples * num_inference_steps
+```
+
+The two entries correspond to `transformer_blocks` and `single_transformer_blocks`.
+This does not reduce the number of smooth candidates or calibration examples evaluated
+by each layer; it removes the need to retain every layer's inputs simultaneously.
+
+FLUX `transformer_blocks` are dual-stream blocks. Their FP interface consumes and returns
+both `encoder_hidden_states` and `hidden_states`. Streaming must preserve both outputs:
+
+```text
+block N (encoder_hidden_states, hidden_states)
+    -> FP reference forward
+    -> (encoder_hidden_states, hidden_states)
+    -> block N + 1
+```
+
+Dropping the encoder stream makes the next block fail with a missing
+`encoder_hidden_states` argument. The scoped `collect_reference_inputs()` path preserves
+the configured diffusion output streams only for calibrated zero-shot propagation. It
+does not change ordinary diffusion loss normalization, SignRound, no-smooth RTN, or the
+Nunchaku runtime kernel. Dual-stream preservation does not itself compress activation
+data; it makes the memory-saving streaming schedule correct for FLUX.
+
 `smooth_enabled=False` is a strict no-smoothing mode:
 
 - no activation calibration hook is installed;
@@ -81,8 +133,8 @@ For a quality-oriented smooth run, add:
 --svdquant_smooth_num_grids 20
 ```
 
-For diffusion calibration this schedules roughly `nsamples * num_inference_steps`
-block inputs, so the command above evaluates about 320 inputs. Use a smaller grid,
+For diffusion calibration each layer evaluates roughly `nsamples * num_inference_steps`
+block inputs, so the command above evaluates about 320 inputs per layer. Use a smaller grid,
 sample count, and denoising-step count only for smoke validation. Smooth search performs
 `2 * num_grids - 1` temporary grouped decompositions in addition to the final
 `svdquant_residual_iters` decomposition loop, so it is substantially slower than the

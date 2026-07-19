@@ -17,6 +17,7 @@ from auto_round.algorithms.transforms.hadamard.config import RotationConfig as _
 from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
 from auto_round.auto_scheme.gen_auto_scheme import AutoScheme
 from auto_round.compressors.base import BaseCompressor
+from auto_round.compressors.calibrated_zero_shot import CalibratedZeroShotCompressor
 from auto_round.compressors.data_driven import CalibratedRTNCompressor, DataDrivenCompressor
 from auto_round.compressors.utils import check_need_act_calibration
 from auto_round.compressors.zero_shot import ZeroShotCompressor
@@ -420,14 +421,23 @@ class AutoRound(object):
         # post_quantize_block) actually runs.  CalibratedRTNCompressor's
         # Preprocessor algorithms require DataDrivenCompressor for per-block lifecycle hooks.
         # The pipeline auto-appends RTN when no block_quantizer is supplied.
-        if any(getattr(config, "requires_calibration", True) for config in preprocessor_configs):
-            return _get_compressor_class(model_type, DataDrivenCompressor)(alg_configs, **local_args, **ctor_kwargs)
+        calibrated_preprocessors = [
+            config for config in preprocessor_configs if getattr(config, "requires_calibration", True)
+        ]
 
         if isinstance(quant_config, SignRoundConfig):
             return _get_compressor_class(model_type, DataDrivenCompressor)(alg_configs, **local_args, **ctor_kwargs)
 
         elif isinstance(quant_config, RTNConfig):
             base_cls = _select_rtn_compressor_base_cls(quant_config, scheme, format, base_kwargs)
+            if calibrated_preprocessors:
+                preprocessor_only = all(
+                    getattr(config, "calibration_stage", None) == "preprocessor" for config in calibrated_preprocessors
+                )
+                if base_cls is ZeroShotCompressor and preprocessor_only:
+                    base_cls = CalibratedZeroShotCompressor
+                else:
+                    base_cls = DataDrivenCompressor
             return _get_compressor_class(model_type, base_cls)(alg_configs, **local_args, **ctor_kwargs)
 
 

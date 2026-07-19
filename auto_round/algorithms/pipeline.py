@@ -289,6 +289,10 @@ class BlockIO:
             self._fp_inputs = None
         return outputs
 
+    def collect_reference_inputs(self, hooks=None) -> Any:
+        """Collect the FP outputs needed as inputs by the next block."""
+        return self.collect_reference(hooks)
+
     @torch.no_grad()
     def collect_quantized_stats(self, hooks=None) -> Any:
         _ = hooks
@@ -440,6 +444,38 @@ class DiffusionBlockIO(BlockIO):
     def _num_samples(self, input_ids) -> int:
         return len(input_ids["hidden_states"]) if isinstance(input_ids, dict) else len(input_ids)
 
+    @torch.no_grad()
+    def collect_reference_inputs(self, hooks=None) -> dict[str, list[torch.Tensor]]:
+        """Preserve every configured diffusion output stream for block propagation."""
+        _ = hooks
+        input_ids = self._inputs_for(InputSource.FP_CACHE)
+        if input_ids is None:
+            raise ValueError("FP calibration inputs are unavailable for this diffusion block.")
+        outputs = {name: [] for name in self.output_config}
+        for start, end in self._iter_batch_ranges(input_ids, self._quantizer.batch_size):
+            indices = torch.arange(start, end).to(torch.long)
+            current_ids, current_others = self._select_inputs(input_ids, self._input_others, indices)
+            raw_output = self._run_block(
+                self._block, self._quantizer, current_ids, current_others, device_manager.device
+            )
+            if isinstance(raw_output, torch.Tensor):
+                raw_output = (raw_output,)
+            if not isinstance(raw_output, (tuple, list)) or len(raw_output) != len(self.output_config):
+                raise ValueError(
+                    f"Diffusion block returned an output incompatible with {self.output_config!r}."
+                )
+            for name, output in zip(self.output_config, raw_output):
+                if not isinstance(output, torch.Tensor):
+                    raise TypeError(f"Diffusion block output {name!r} is not a tensor.")
+                output = output.to(self._quantizer.compress_context.cache_device)
+                if self._quantizer.batch_size == 1:
+                    outputs[name].append(output)
+                else:
+                    outputs[name].extend(list(torch.split(output, 1, dim=self.batch_dim)))
+        self._reference_outputs = outputs["hidden_states"]
+        self._quantizer.compress_context.clear_memory()
+        return outputs
+
     def _normalize_output_for_loss(self, output: Any) -> torch.Tensor:
         if isinstance(output, torch.Tensor):
             return output
@@ -502,6 +538,9 @@ class BlockContext:
 
     def collect_reference(self, hooks=None) -> Any:
         return self.io.collect_reference(hooks)
+
+    def collect_reference_inputs(self, hooks=None) -> Any:
+        return self.io.collect_reference_inputs(hooks)
 
     def collect_quantized_stats(self, hooks=None) -> Any:
         return self.io.collect_quantized_stats(hooks)

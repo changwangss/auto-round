@@ -72,6 +72,28 @@ class ZeroShotCompressor(BaseCompressor):
         )
         self.lr = 5e-3
 
+    def _create_block_context(self, block: torch.nn.Module, block_name: str) -> BlockContext:
+        """Create the data-free context used by the terminal block quantizer."""
+        return BlockContext(
+            model=self.model_context.model,
+            block=block,
+            block_names=[block_name],
+            block_name=block_name,
+            block_index=0,
+            io=self.quantizer.create_block_io(None, {}, None, block),
+            device=device_manager.device,
+            is_mllm=self.model_context.is_mllm,
+            is_diffusion=self.model_context.is_diffusion,
+        )
+
+    def _run_block_pipeline(self, ctx: BlockContext) -> None:
+        """Apply weight transforms, terminal quantization, and transform cleanup."""
+        for preprocessor in self._pipeline.preprocessors:
+            preprocessor.pre_quantize_block(ctx)
+        self.quantizer.quantize_block(ctx)
+        for preprocessor in self._pipeline.preprocessors:
+            preprocessor.post_quantize_block(ctx)
+
     def quantize_block(
         self,
         block: torch.nn.Module,
@@ -175,20 +197,8 @@ class ZeroShotCompressor(BaseCompressor):
                     materialize_model_(block)
 
                     # ── Pure algorithm ────────────────────────────────────────
-                    ctx = BlockContext(
-                        model=self.model_context.model,
-                        block=block,
-                        block_names=[block_name],
-                        block_name=block_name,
-                        block_index=0,
-                        io=self.quantizer.create_block_io(None, {}, None, block),
-                        device=device_manager.device,
-                    )
-                    for preprocessor in self._pipeline.preprocessors:
-                        preprocessor.pre_quantize_block(ctx)
-                    self.quantizer.quantize_block(ctx)
-                    for preprocessor in self._pipeline.preprocessors:
-                        preprocessor.post_quantize_block(ctx)
+                    ctx = self._create_block_context(block, block_name)
+                    self._run_block_pipeline(ctx)
                     ctx.finish()
 
                     # ── MoE scale alignment for FP8 dispatch efficiency ────────────────
