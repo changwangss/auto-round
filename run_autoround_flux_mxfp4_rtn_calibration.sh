@@ -68,7 +68,7 @@ echo "Log: $LOG"
   --svdquant_model_adapter flux \
   --format svdquant_nunchaku \
   --device 0 \
-  --low_gpu_mem_usage \
   --disable_low_cpu_mem_usage \
   --output_dir "$OUT" \
   2>&1 | tee "$LOG"
+
