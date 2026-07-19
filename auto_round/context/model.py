@@ -326,12 +326,6 @@ class ModelContext(BaseContext):
         for n, m in self.model.named_modules():
             if hasattr(m, "orig_forward"):
                 true_orig = getattr(m, "_true_orig_forward", m.orig_forward)
-                replacement_attr = getattr(m, "_autoround_replaced_forward_attr", "forward")
-                if replacement_attr == "_old_forward":
-                    m._old_forward = true_orig
-                    delattr(m, "orig_forward")
-                    delattr(m, "_autoround_replaced_forward_attr")
-                    continue
                 if restore_positional_wrapper:
                     # Restore orig_forward so that any wrapper (e.g. from
                     # wrap_block_forward_positional_to_kwargs) can still access it.
@@ -348,8 +342,6 @@ class ModelContext(BaseContext):
                     delattr(m, "orig_forward")
                     if hasattr(m, "_wrapped_forward_before_replace"):
                         delattr(m, "_wrapped_forward_before_replace")
-                if hasattr(m, "_autoround_replaced_forward_attr"):
-                    delattr(m, "_autoround_replaced_forward_attr")
         for hook_handle in self.hook_handles:
             hook_handle.remove()
         self.hook_handles = []
