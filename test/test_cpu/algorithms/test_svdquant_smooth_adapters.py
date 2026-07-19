@@ -269,3 +269,44 @@ def test_flux_qkv_search_uses_parent_output_and_final_shared_down(monkeypatch):
         torch.testing.assert_close(wrapper.lora_down.weight, wrappers[0].lora_down.weight, rtol=0, atol=0)
     actual_output = block.attn(hidden_states, encoder_hidden_states=encoder_hidden_states)[0]
     torch.testing.assert_close(actual_output, reference_output, rtol=0, atol=1e-5)
+
+
+def test_flux_smooth_search_restores_bfloat16_evaluation_dtype(monkeypatch):
+    import auto_round.algorithms.transforms.svdquant.residual as residual_module
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+    from auto_round.algorithms.transforms.svdquant.wrapper import SVDQuantLinear
+
+    block = FluxTransformerBlock(width=2).to(torch.bfloat16)
+    block.global_name = "transformer_blocks.0"
+    for name, projection in block.named_modules():
+        if not isinstance(projection, torch.nn.Linear):
+            continue
+        projection.data_type = "int"
+        projection.bits = 4
+        projection.group_size = 2
+        projection.sym = True
+        projection.global_name = f"{block.global_name}.{name}"
+
+    monkeypatch.setattr(residual_module, "rtn_qdq_residual", lambda residual, _scheme: torch.round(residual))
+    transform = SVDQuantTransform(
+        SVDQuantConfig(
+            rank=1,
+            smooth_enabled=True,
+            smooth_num_grids=2,
+            low_rank_dtype="bfloat16",
+            target_modules=["attn.to_q", "attn.to_k", "attn.to_v"],
+        )
+    )
+    ctx = type("Context", (), {"block": block, "block_name": block.global_name})()
+    hidden_states = torch.randn(1, 2, 2)
+    encoder_hidden_states = torch.randn(1, 1, 2)
+
+    with transform.block_forward_hooks(ctx), torch.autocast("cpu", dtype=torch.bfloat16):
+        block.attn(hidden_states, encoder_hidden_states=encoder_hidden_states)
+
+    transform.pre_quantize_block(ctx)
+
+    assert all(
+        isinstance(projection, SVDQuantLinear) for projection in (block.attn.to_q, block.attn.to_k, block.attn.to_v)
+    )

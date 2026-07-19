@@ -83,15 +83,16 @@ def _detach_to_cpu(value: Any) -> Any:
     return value
 
 
-def _move_to_device(value: Any, device: torch.device) -> Any:
+def _move_to_device(value: Any, device: torch.device, dtype: torch.dtype | None = None) -> Any:
     if torch.is_tensor(value):
-        return value.to(device)
+        target_dtype = dtype if dtype is not None and value.is_floating_point() else value.dtype
+        return value.to(device=device, dtype=target_dtype)
     if isinstance(value, tuple):
-        return tuple(_move_to_device(item, device) for item in value)
+        return tuple(_move_to_device(item, device, dtype) for item in value)
     if isinstance(value, list):
-        return [_move_to_device(item, device) for item in value]
+        return [_move_to_device(item, device, dtype) for item in value]
     if isinstance(value, dict):
-        return {key: _move_to_device(item, device) for key, item in value.items()}
+        return {key: _move_to_device(item, device, dtype) for key, item in value.items()}
     return value
 
 
@@ -266,8 +267,9 @@ class SVDQuantTransform(BaseWeightTransformer):
                 if len(group.projections) == 1 and evaluation_module is group.projections[0]:
                     evaluation_module = wrappers[0]
                 device = group.projections[0].weight.device
-                args = _move_to_device(call.args, device)
-                kwargs = group.filter_evaluation_kwargs(_move_to_device(call.kwargs, device))
+                dtype = group.projections[0].weight.dtype
+                args = _move_to_device(call.args, device, dtype)
+                kwargs = group.filter_evaluation_kwargs(_move_to_device(call.kwargs, device, dtype))
                 actual = group.normalize_output(evaluation_module(*args, **kwargs))
                 reference = tuple(tensor.to(device) for tensor in group.normalize_output(call.output))
                 if len(actual) != len(reference):
