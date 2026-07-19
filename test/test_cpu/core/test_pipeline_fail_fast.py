@@ -1,5 +1,7 @@
 """Fast unit tests for algorithm registry and pipeline construction."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -62,6 +64,49 @@ def test_diffusion_block_io_preserves_single_sample_tensor_batch_dimension():
     _, input_others = io._select_inputs(io._fp_inputs, io._input_others, torch.tensor([0]))
 
     assert input_others["temb"].shape == (1, 32)
+
+
+def test_diffusion_block_io_preserves_flux_dual_stream_outputs_between_blocks():
+    class FluxTransformerBlock(torch.nn.Module):
+        def forward(self, hidden_states, encoder_hidden_states):
+            return encoder_hidden_states + 1, hidden_states + 2
+
+    class Quantizer:
+        batch_size = 1
+        model_context = SimpleNamespace(amp=False, amp_dtype=torch.float32)
+        compress_context = SimpleNamespace(cache_device="cpu", clear_memory=lambda: None)
+
+        @staticmethod
+        def _resolve_block_forward():
+            def run(block, hidden_states, input_others, _amp, _amp_dtype, _device, _output_index):
+                input_others = dict(input_others)
+                input_others.pop("positional_inputs", None)
+                return block(hidden_states, **input_others)
+
+            return run
+
+    def collect(block, inputs):
+        io = DiffusionBlockIO(
+            _fp_inputs=inputs,
+            _input_others={"positional_inputs": []},
+            _quantizer=Quantizer(),
+            _block=block,
+            output_config=["encoder_hidden_states", "hidden_states"],
+        )
+        return io, io.collect_reference()
+
+    inputs = {
+        "encoder_hidden_states": [torch.tensor([[10.0]])],
+        "hidden_states": [torch.tensor([[20.0]])],
+    }
+    first_io, first_outputs = collect(FluxTransformerBlock(), inputs)
+    second_io, second_outputs = collect(FluxTransformerBlock(), first_outputs)
+
+    assert set(first_outputs) == {"encoder_hidden_states", "hidden_states"}
+    torch.testing.assert_close(first_outputs["encoder_hidden_states"][0], torch.tensor([[11.0]]))
+    torch.testing.assert_close(first_io.get_reference_outputs(torch.tensor([0])), torch.tensor([[22.0]]))
+    torch.testing.assert_close(second_outputs["encoder_hidden_states"][0], torch.tensor([[12.0]]))
+    torch.testing.assert_close(second_io.get_reference_outputs(torch.tensor([0])), torch.tensor([[24.0]]))
 
 
 def test_pipeline_duplicate_preprocessor_rejected():

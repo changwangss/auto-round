@@ -440,6 +440,54 @@ class DiffusionBlockIO(BlockIO):
     def _num_samples(self, input_ids) -> int:
         return len(input_ids["hidden_states"]) if isinstance(input_ids, dict) else len(input_ids)
 
+    @torch.no_grad()
+    def _collect_outputs(self, block, quantizer, *, source: InputSource, batch_size: int, save: bool = True):
+        input_ids = self._inputs_for(source)
+        if input_ids is None:
+            raise ValueError(f"Input source {source.name} is unavailable for this block.")
+        outputs = {name: [] for name in self.output_config}
+        for start, end in self._iter_batch_ranges(input_ids, batch_size):
+            indices = torch.arange(start, end).to(torch.long)
+            current_input_ids, current_input_others = self._select_inputs(input_ids, self._input_others, indices)
+            raw_output = self._run_block(
+                block, quantizer, current_input_ids, current_input_others, device_manager.device
+            )
+            mapped_output = self._map_output_for_cache(raw_output)
+            if not save:
+                continue
+            for name, output in mapped_output.items():
+                output = output.to(quantizer.compress_context.cache_device)
+                if quantizer.batch_size == 1:
+                    outputs[name].append(output)
+                else:
+                    outputs[name].extend(list(torch.split(output, 1, dim=self.batch_dim)))
+        quantizer.compress_context.clear_memory()
+        return outputs
+
+    def _map_output_for_cache(self, output: Any) -> dict[str, torch.Tensor]:
+        if isinstance(output, torch.Tensor):
+            output = (output,)
+        if not isinstance(output, (tuple, list)):
+            raise TypeError(
+                "DiffusionBlockIO forward must return a tensor or tuple/list of tensors. "
+                f"Got {type(output).__name__}."
+            )
+        if len(output) != len(self.output_config):
+            raise ValueError(
+                f"Diffusion block returned {len(output)} tensors, but output_config defines "
+                f"{len(self.output_config)} keys."
+            )
+        if not all(isinstance(item, torch.Tensor) for item in output):
+            raise TypeError("DiffusionBlockIO expected every configured block output to be a tensor.")
+        return dict(zip(self.output_config, output))
+
+    def get_reference_outputs(self, indices: torch.Tensor, *, device=None) -> torch.Tensor:
+        if not isinstance(self._reference_outputs, dict) or "hidden_states" not in self._reference_outputs:
+            raise ValueError("Diffusion reference outputs have not been collected for this block.")
+        outputs = self._reference_outputs["hidden_states"]
+        output = torch.cat([outputs[i] for i in indices], dim=self.batch_dim)
+        return output.to(device) if device is not None else output
+
     def _normalize_output_for_loss(self, output: Any) -> torch.Tensor:
         if isinstance(output, torch.Tensor):
             return output
