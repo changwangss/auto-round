@@ -8,10 +8,12 @@ from packaging import version
 from auto_round import AutoRound
 from auto_round.compressors.diffusion_mixin import (
     DiffusionMixin,
+    _diffusion_device_placement,
     _move_pipeline_to_model_device_for_calibration,
     _pipeline_needs_dtype_alignment,
     _prepare_single_device_pipeline_for_calibration,
 )
+from auto_round.utils.device_manager import device_manager
 from auto_round.utils.model import _resolve_diffusion_load_dtype
 
 from ...helpers import get_model_path, transformers_version
@@ -96,6 +98,13 @@ def test_single_device_low_gpu_memory_uses_model_cpu_offload():
 
     assert _prepare_single_device_pipeline_for_calibration(pipe, "cuda:0", low_gpu_mem_usage=True) == "model"
     assert pipe.offload_device == "cuda:0"
+
+
+def test_diffusion_placement_uses_process_device_manager(monkeypatch):
+    monkeypatch.setattr(device_manager, "_device_map", "1")
+    monkeypatch.setattr(device_manager, "_device_list", ["cuda:1"])
+
+    assert _diffusion_device_placement() == ("1", ["cuda:1"])
 
 
 @pytest.fixture

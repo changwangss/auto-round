@@ -86,6 +86,12 @@ def _prepare_single_device_pipeline_for_calibration(pipe, target_device, *, low_
     return "model"
 
 
+def _diffusion_device_placement():
+    """Return diffusion placement from the process-wide device manager."""
+
+    return device_manager.device_map, device_manager.device_list
+
+
 def _rewrite_nunchaku_pipeline_index(output_dir: str | os.PathLike, transformer_names: list[str]) -> None:
     """Point exported transformer components at their Nunchaku runtime classes."""
 
@@ -318,8 +324,7 @@ class DiffusionMixin:
             pipe.to(model.dtype)
 
         # Dispatch secondary transformer to GPU(s)
-        device_map = getattr(self.compress_context, "device_map", None)
-        device_list = getattr(self.compress_context, "device_list", [])
+        device_map, device_list = _diffusion_device_placement()
         multi_device = is_auto_device_mapping(device_map) and len(device_list) > 1
 
         if multi_device:
@@ -389,8 +394,7 @@ class DiffusionMixin:
         # would break the existing placement.
         _move_pipeline_to_model_device_for_calibration(pipe, self.model)
 
-        device_map = getattr(self.compress_context, "device_map", None)
-        device_list = getattr(self.compress_context, "device_list", [])
+        device_map, device_list = _diffusion_device_placement()
         # Skip dispatch for secondary transformers
         if (
             not getattr(self, "_inputs_cached", False)
@@ -497,7 +501,7 @@ class DiffusionMixin:
         if not additional:
             # Single-transformer path: let calib() own pipeline dispatch.
             pipe = self.model_context.pipe
-            device_map = getattr(self.compress_context, "device_map", None)
+            device_map, _ = _diffusion_device_placement()
             cpu_offload_mode = None
             if device_map is not None and not is_auto_device_mapping(device_map):
                 target_device = get_major_device(device_map)
