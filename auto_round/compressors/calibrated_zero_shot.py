@@ -11,7 +11,9 @@ from typing import Any, Callable, Optional, Union
 import torch
 
 from auto_round.algorithms.pipeline import BlockContext
+from auto_round.calibration.sampling import uniform_call_indices
 from auto_round.compressors.zero_shot import ZeroShotCompressor
+from auto_round.logger import logger
 from auto_round.modeling.fused_moe.replace_modules import materialize_model_
 from auto_round.utils import convert_module_to_hp_if_necessary, get_block_names
 from auto_round.utils.device_manager import device_manager
@@ -34,9 +36,38 @@ class CalibratedZeroShotCompressor(ZeroShotCompressor):
         dataset: Union[str, list, tuple, torch.utils.data.DataLoader] = "NeelNanda/pile-10k",
         **kwargs,
     ) -> None:
+        configs = config if isinstance(config, list) else [config]
+        self._smooth_max_calibration_calls = next(
+            (
+                candidate.smooth_max_calibration_calls
+                for candidate in configs
+                if hasattr(candidate, "smooth_max_calibration_calls")
+            ),
+            128,
+        )
         kwargs["iters"] = 0
         super().__init__(config=config, model=model, **kwargs)
         self.dataset = dataset
+
+    def prepare_calibration_call_selection(self, total_calls: int) -> None:
+        """Prepare one deterministic call sample shared by every block group."""
+        selected = uniform_call_indices(total_calls, self._smooth_max_calibration_calls)
+        self._selected_calibration_call_indices = frozenset(selected)
+        self._calibration_call_counts: dict[str, int] = {}
+        logger.info(
+            "Retaining %d of %d diffusion transformer calls for SVDQuant calibration",
+            len(selected),
+            total_calls,
+        )
+
+    def should_cache_calibration_call(self, name: str) -> bool:
+        """Return whether this block invocation belongs to the shared call sample."""
+        selected = getattr(self, "_selected_calibration_call_indices", None)
+        if selected is None:
+            return True
+        call_index = self._calibration_call_counts.get(name, 0)
+        self._calibration_call_counts[name] = call_index + 1
+        return call_index in selected
 
     def post_init(self) -> None:
         if self._post_init_done:

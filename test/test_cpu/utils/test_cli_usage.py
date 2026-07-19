@@ -272,9 +272,11 @@ def test_cli_builds_svdquant_config_with_smoothing_disabled_by_default():
 
     assert args.svdquant_smooth_enabled is False
     assert args.svdquant_smooth_num_grids == 20
+    assert args.svdquant_smooth_max_calibration_calls == 128
     assert isinstance(configs[0], SVDQuantConfig)
     assert configs[0].smooth_enabled is False
     assert configs[0].smooth_num_grids == 20
+    assert configs[0].smooth_max_calibration_calls == 128
 
 
 def test_cli_enables_svdquant_smoothing_explicitly():
@@ -292,6 +294,8 @@ def test_cli_enables_svdquant_smoothing_explicitly():
             "--enable_svdquant_smooth",
             "--svdquant_smooth_num_grids",
             "8",
+            "--svdquant_smooth_max_calibration_calls",
+            "16",
         ]
     )
     configs = AlgorithmHandler.build_configs(args, {})
@@ -300,6 +304,7 @@ def test_cli_enables_svdquant_smoothing_explicitly():
     assert isinstance(configs[0], SVDQuantConfig)
     assert configs[0].smooth_enabled is True
     assert configs[0].smooth_num_grids == 8
+    assert configs[0].smooth_max_calibration_calls == 16
 
 
 def test_cli_builds_svdquant_residual_iteration_config():

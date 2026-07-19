@@ -203,7 +203,7 @@ class SVDQuantTransform(BaseWeightTransformer):
 
             replacements: list[tuple[str, SVDQuantLinear]] = []
             for key, calibration in self._smooth_calibration.items():
-                wrappers = self._decompose_group(calibration.group, selected_scales[key])
+                wrappers = self._decompose_group(calibration, selected_scales[key], ctx.block, local_names)
                 for projection, wrapper in zip(calibration.group.projections, wrappers):
                     local_name = local_names.get(id(projection))
                     if local_name is None:
@@ -250,6 +250,17 @@ class SVDQuantTransform(BaseWeightTransformer):
     ) -> float:
         group = calibration.group
         wrappers = self._candidate_group_wrappers(group, scale)
+        return self._score_group_wrappers(calibration, wrappers, block, local_names)
+
+    def _score_group_wrappers(
+        self,
+        calibration: SmoothGroupCalibration,
+        wrappers: list[SVDQuantLinear],
+        block: torch.nn.Module,
+        local_names: dict[int, str],
+    ) -> float:
+        """Score candidate wrappers against captured outputs one call at a time."""
+        group = calibration.group
         replacements = []
         for projection, wrapper in zip(group.projections, wrappers):
             local_name = local_names.get(id(projection))
@@ -278,6 +289,7 @@ class SVDQuantTransform(BaseWeightTransformer):
                     if actual_tensor.shape != reference_tensor.shape:
                         raise ValueError("smooth-search output tensor shape changed")
                     error += torch.sum((actual_tensor.float() - reference_tensor.float()).square()).double().cpu()
+                del args, kwargs, actual, reference
             return error.item()
         finally:
             for local_name, projection, _wrapper in replacements:
@@ -307,7 +319,14 @@ class SVDQuantTransform(BaseWeightTransformer):
             residuals.append(residual_module.rtn_qdq_residual(residual, self._residual_quant_scheme(projection)))
         return self._build_group_wrappers(group, residuals, deployed_down, up_parts, scale)
 
-    def _decompose_group(self, group: SmoothSearchGroup, scale: torch.Tensor) -> list[SVDQuantLinear]:
+    def _decompose_group(
+        self,
+        calibration: SmoothGroupCalibration,
+        scale: torch.Tensor,
+        block: torch.nn.Module,
+        local_names: dict[int, str],
+    ) -> list[SVDQuantLinear]:
+        group = calibration.group
         weights = [
             projection.weight.detach().to(torch.float32) * scale.to(projection.weight.device)
             for projection in group.projections
@@ -330,17 +349,29 @@ class SVDQuantTransform(BaseWeightTransformer):
                 )
             ]
         else:
-            residuals, deployed_down, deployed_up = self._iterate_group_residual(group, stacked, rank, low_rank_dtype)
+            residuals, deployed_down, deployed_up = self._iterate_group_residual(
+                calibration=calibration,
+                block=block,
+                local_names=local_names,
+                stacked=stacked,
+                rank=rank,
+                low_rank_dtype=low_rank_dtype,
+                scale=scale,
+            )
         up_parts = deployed_up.split([projection.out_features for projection in group.projections], dim=0)
         return self._build_group_wrappers(group, residuals, deployed_down, up_parts, scale)
 
     def _iterate_group_residual(
         self,
-        group: SmoothSearchGroup,
+        calibration: SmoothGroupCalibration,
+        block: torch.nn.Module,
+        local_names: dict[int, str],
         stacked: torch.Tensor,
         rank: int,
         low_rank_dtype: torch.dtype,
+        scale: torch.Tensor,
     ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        group = calibration.group
         output_sizes = [projection.out_features for projection in group.projections]
         quantized_residual = torch.zeros_like(stacked)
         best: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -353,24 +384,40 @@ class SVDQuantTransform(BaseWeightTransformer):
                 deployed_up = stacked_up.to(low_rank_dtype)
                 deployed_low_rank = deployed_up.float() @ deployed_down.float()
                 residual_parts = (stacked - deployed_low_rank).split(output_sizes, dim=0)
-                qdq_parts = [
+                qdq_residuals = [
                     residual_module.rtn_qdq_residual(
                         residual.to(projection.weight.dtype), self._residual_quant_scheme(projection)
-                    ).float()
+                    )
                     for residual, projection in zip(residual_parts, group.projections)
                 ]
-                quantized_residual = torch.cat(qdq_parts, dim=0)
-                error_value = torch.sum((stacked - (quantized_residual + deployed_low_rank)).square()).item()
-            except (RuntimeError, ValueError) as exc:
+                quantized_residual = torch.cat([residual.float() for residual in qdq_residuals], dim=0)
+                up_parts = deployed_up.split(output_sizes, dim=0)
+                wrappers = self._build_group_wrappers(
+                    group,
+                    qdq_residuals,
+                    deployed_down,
+                    up_parts,
+                    scale,
+                )
+                error_value = self._score_group_wrappers(calibration, wrappers, block, local_names)
+                del qdq_residuals, wrappers
+            except (RuntimeError, ValueError, TypeError) as exc:
                 last_failure = f"iteration {iteration}: {exc}"
                 break
-            improved = math.isfinite(error_value) and error_value < best_error
-            if improved:
+            accepted = math.isfinite(error_value) and error_value <= best_error
+            if accepted:
                 best = (deployed_down.clone(), deployed_up.clone())
                 best_error = error_value
             elif not math.isfinite(error_value):
-                last_failure = f"iteration {iteration}: reconstruction error is non-finite"
-            if self.config.residual_early_stop and best is not None and not improved:
+                last_failure = f"iteration {iteration}: output error is non-finite"
+            if self.config.residual_early_stop and best is not None and not accepted:
+                logger.info(
+                    "SVDQuant residual early stop for %s at iteration %d: output error %.6g > best %.6g",
+                    group.key,
+                    iteration,
+                    error_value,
+                    best_error,
+                )
                 break
 
         if best is None:

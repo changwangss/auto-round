@@ -13,6 +13,7 @@
 # limitations under the License.
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -235,6 +236,14 @@ class DiffusionMixin:
         ``_should_stop_cache_forward``.
         """
         return "diffusion"
+
+    def _prepare_calibration_call_selection(self) -> None:
+        """Initialize an optional bounded call sample before diffusion calibration."""
+        prepare_call_selection = getattr(self, "prepare_calibration_call_selection", None)
+        if prepare_call_selection is None:
+            return
+        num_batches = math.ceil(self.nsamples / max(int(self.batch_size), 1))
+        prepare_call_selection(num_batches * max(int(self.num_inference_steps), 1))
 
     def _build_pipeline_call_kwargs(self, pipe, prompts):
         """Build kwargs for pipeline.__call__."""
@@ -521,6 +530,7 @@ class DiffusionMixin:
                     )
 
             logger.info("start to cache block inputs")
+            self._prepare_calibration_call_selection()
             all_inputs = self.try_cache_inter_data_gpucpu(
                 to_cache_block_names,
                 self.nsamples,

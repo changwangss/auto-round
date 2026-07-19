@@ -146,6 +146,12 @@ def build_quantize_parser(*, prog: str = "auto_round quantize") -> argparse.Argu
         help="Number of candidates per SVDQuant smooth search grid family.",
     )
     rt.add_argument(
+        "--svdquant_smooth_max_calibration_calls",
+        default=128,
+        type=int,
+        help="Maximum diffusion transformer calls retained for SVDQuant smooth calibration.",
+    )
+    rt.add_argument(
         "--svdquant_target_modules",
         default=None,
         type=str,

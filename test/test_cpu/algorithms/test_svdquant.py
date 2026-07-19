@@ -16,6 +16,7 @@ def test_svdquant_config_residual_iteration_defaults():
 
     assert config.smooth_enabled is False
     assert config.smooth_num_grids == 20
+    assert config.smooth_max_calibration_calls == 128
     assert not hasattr(config, "smooth_alpha")
     assert config.residual_iters == 1
     assert config.residual_early_stop is False
@@ -25,6 +26,7 @@ def test_svdquant_config_residual_iteration_defaults():
     assert "residual_early_stop=False" in repr(config)
     assert "residual_quant_method='rtn'" in repr(config)
     assert "smooth_enabled=False" in repr(config)
+    assert "smooth_max_calibration_calls=128" in repr(config)
 
 
 def test_svdquant_with_smoothing_requires_calibration():
@@ -47,6 +49,14 @@ def test_svdquant_config_rejects_invalid_smooth_num_grids(value):
 
     with pytest.raises(ValueError, match="smooth_num_grids"):
         SVDQuantConfig(smooth_num_grids=value)
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.5, None, "16"])
+def test_svdquant_config_rejects_invalid_smooth_max_calibration_calls(value):
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    with pytest.raises(ValueError, match="smooth_max_calibration_calls"):
+        SVDQuantConfig(smooth_max_calibration_calls=value)
 
 
 def test_svdquant_config_rejects_invalid_residual_iteration_count():

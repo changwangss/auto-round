@@ -202,6 +202,36 @@ def test_transform_captures_bounded_group_inputs_and_shared_parent_call():
     assert transform._smooth_calibration == {}
 
 
+def test_transform_smooth_capture_does_not_exceed_cached_call_count():
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    block = FluxTransformerBlock()
+    block.global_name = "transformer_blocks.0"
+    transform = SVDQuantTransform(SVDQuantConfig(smooth_enabled=True))
+    ctx = type(
+        "Context",
+        (),
+        {"block": block, "block_name": block.global_name, "num_samples": 3, "bs": 1},
+    )()
+    hidden_states = torch.randn(1, 3, 4)
+    encoder_hidden_states = torch.randn(1, 2, 4)
+
+    with transform.block_forward_hooks(ctx):
+        for call_index in range(8):
+            block.attn(
+                hidden_states + call_index,
+                encoder_hidden_states=encoder_hidden_states + call_index,
+            )
+
+    qkv = transform._smooth_calibration["transformer_blocks.0.attn.qkv"]
+    added_qkv = transform._smooth_calibration["transformer_blocks.0.attn.add_qkv"]
+    assert len(qkv.projection_inputs) == 3
+    assert len(qkv.evaluation_calls) == 3
+    assert len(added_qkv.evaluation_calls) == 3
+    assert all(left is right for left, right in zip(qkv.evaluation_calls, added_qkv.evaluation_calls))
+
+
 def test_flux_qkv_search_uses_parent_output_and_final_shared_down(monkeypatch):
     import auto_round.algorithms.transforms.svdquant.residual as residual_module
     from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
@@ -310,3 +340,85 @@ def test_flux_smooth_search_restores_bfloat16_evaluation_dtype(monkeypatch):
     assert all(
         isinstance(projection, SVDQuantLinear) for projection in (block.attn.to_q, block.attn.to_k, block.attn.to_v)
     )
+
+
+def test_group_output_error_accumulates_captured_calls_and_restores_projection():
+    from auto_round.algorithms.transforms.svdquant.apply import (
+        CapturedEvaluation,
+        SVDQuantTransform,
+        SmoothGroupCalibration,
+    )
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    block = UnknownBlock()
+    block.global_name = "unknown.0"
+    group = discover_smooth_search_groups(block, _all_targets)[0]
+    original = block.first
+    candidate = torch.nn.Linear(4, 5, bias=True)
+    candidate.weight.data.zero_()
+    candidate.bias.data.zero_()
+    inputs = (torch.tensor([[1.0, -2.0, 0.5, 3.0]]), torch.tensor([[-1.0, 0.0, 2.0, 1.0]]))
+    calls = [
+        CapturedEvaluation(args=(value,), kwargs={}, output=original(value).detach().clone()) for value in inputs
+    ]
+    calibration = SmoothGroupCalibration(group=group, evaluation_calls=calls)
+    transform = SVDQuantTransform(SVDQuantConfig(smooth_enabled=True))
+    expected = sum(torch.sum(call.output.square()).item() for call in calls)
+
+    error = transform._score_group_wrappers(calibration, [candidate], block, {id(original): "first"})
+
+    assert error == expected
+    assert block.first is original
+
+
+def test_group_residual_early_stop_continues_on_equal_error_and_stops_when_worse(monkeypatch):
+    import auto_round.algorithms.transforms.svdquant.apply as apply_module
+    import auto_round.algorithms.transforms.svdquant.residual as residual_module
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform, SmoothGroupCalibration
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    block = UnknownBlock()
+    block.global_name = "unknown.0"
+    projection = block.first
+    projection.data_type = "int"
+    projection.bits = 4
+    projection.group_size = 2
+    projection.sym = True
+    group = discover_smooth_search_groups(block, _all_targets)[0]
+    calibration = SmoothGroupCalibration(group=group)
+    transform = SVDQuantTransform(
+        SVDQuantConfig(rank=1, smooth_enabled=True, residual_iters=100, residual_early_stop=True)
+    )
+    svd_iterations = []
+
+    def fake_svd(weight, rank):
+        iteration = len(svd_iterations) + 1
+        svd_iterations.append(iteration)
+        down = torch.full((rank, weight.shape[1]), float(iteration))
+        up = torch.zeros((weight.shape[0], rank))
+        return torch.zeros_like(weight), down, up
+
+    scored_down_values = []
+    errors = iter((3.0, 3.0, 4.0, 2.0))
+
+    def fake_score(_calibration, wrappers, _block, _local_names):
+        scored_down_values.append(wrappers[0].lora_down.weight[0, 0].item())
+        return next(errors)
+
+    monkeypatch.setattr(apply_module, "_truncated_svd", fake_svd)
+    monkeypatch.setattr(residual_module, "rtn_qdq_residual", lambda residual, _scheme: residual)
+    monkeypatch.setattr(transform, "_score_group_wrappers", fake_score)
+
+    with torch.no_grad():
+        _residuals, best_down, _best_up = transform._iterate_group_residual(
+            calibration=calibration,
+            block=block,
+            local_names={id(projection): "first"},
+            stacked=projection.weight.detach().float(),
+            rank=1,
+            low_rank_dtype=torch.float32,
+            scale=torch.ones(projection.in_features),
+        )
+
+    assert scored_down_values == [1.0, 2.0, 3.0]
+    assert best_down[0, 0].item() == 2.0

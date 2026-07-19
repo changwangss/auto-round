@@ -59,7 +59,20 @@ def make_block_forward_func(state, name: str) -> Callable:
                 new_data = alibi
         return new_data
 
+    def call_original_forward(m, hidden_states, positional_inputs, kwargs):
+        if hidden_states is not None:
+            kwargs.pop("hidden_states", None)
+            if positional_inputs:
+                return m.orig_forward(hidden_states=hidden_states, *positional_inputs, **kwargs)
+            return m.orig_forward(hidden_states, **kwargs)
+        # Currently only for Llama-3.2-Vision-Instruct Series
+        return m.orig_forward(*positional_inputs, **kwargs)
+
     def forward_capture(m, hidden_states=None, *positional_inputs, **kwargs):
+        cache_selector = getattr(state, "should_cache_calibration_call", None)
+        if cache_selector is not None and not cache_selector(name):
+            return call_original_forward(m, hidden_states, positional_inputs, kwargs)
+
         if name not in state.inputs:
             state.inputs[name] = {}
             init_cache(positional_inputs, state.inputs[name])
@@ -144,16 +157,7 @@ def make_block_forward_func(state, name: str) -> Callable:
 
         if state._should_stop_cache_forward(name):
             raise NotImplementedError
-        else:
-            if hidden_states is not None:
-                kwargs.pop("hidden_states", None)
-                if positional_inputs:
-                    return m.orig_forward(hidden_states=hidden_states, *positional_inputs, **kwargs)
-                else:
-                    return m.orig_forward(hidden_states, **kwargs)
-            else:
-                # Currently only for Llama-3.2-Vision-Instruct Series
-                return m.orig_forward(*positional_inputs, **kwargs)
+        return call_original_forward(m, hidden_states, positional_inputs, kwargs)
 
     # Apply positional-to-kwargs conversion so positional_inputs get their proper parameter names.
     from auto_round.utils.model import wrap_block_forward_positional_to_kwargs

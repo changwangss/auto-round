@@ -135,3 +135,28 @@ def test_normal_tensor_kwarg_unaffected():
     stored = state.inputs[name].get("attention_mask")
     assert isinstance(stored, list)
     assert len(stored) == 2
+
+
+def test_unselected_calibration_calls_forward_without_cpu_cache():
+    state = _make_state(batch_size=1)
+    decisions = iter((False, True, False))
+    state.should_cache_calibration_call = lambda _name: next(decisions)
+    name = "decoder.layers.0"
+
+    class CountingModule(_FakeModule):
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def orig_forward(self, hidden_states, **kwargs):
+            self.forward_calls += 1
+            return hidden_states + 1
+
+    module = _attach_capture(state, name, CountingModule())
+    hidden = torch.randn(1, 4, 8)
+
+    outputs = [module(hidden) for _ in range(3)]
+
+    assert module.forward_calls == 3
+    assert all(torch.equal(output, hidden + 1) for output in outputs)
+    assert len(state.inputs[name]["hidden_states"]) == 1

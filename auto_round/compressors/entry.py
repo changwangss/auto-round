@@ -574,6 +574,7 @@ class AutoRoundCompatible:
         rank = kwargs.pop("svdquant_rank", 32)
         smooth_enabled = kwargs.pop("svdquant_smooth_enabled", False)
         smooth_num_grids = kwargs.pop("svdquant_smooth_num_grids", 20)
+        smooth_max_calibration_calls = kwargs.pop("svdquant_smooth_max_calibration_calls", 128)
         target_modules = kwargs.pop("svdquant_target_modules", None)
         exclude_modules = kwargs.pop("svdquant_exclude_modules", None)
         low_rank_dtype = kwargs.pop("svdquant_low_rank_dtype", "bf16")
@@ -586,6 +587,7 @@ class AutoRoundCompatible:
             rank=rank,
             smooth_enabled=smooth_enabled,
             smooth_num_grids=smooth_num_grids,
+            smooth_max_calibration_calls=smooth_max_calibration_calls,
             target_modules=target_modules,
             exclude_modules=exclude_modules,
             low_rank_dtype=low_rank_dtype,

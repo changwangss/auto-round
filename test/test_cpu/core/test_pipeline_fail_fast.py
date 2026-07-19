@@ -18,6 +18,7 @@ from auto_round.algorithms.quantization.rtn.quantizer import RTNQuantizer
 from auto_round.compressors.base import collect_user_scheme_overrides
 from auto_round.compressors.calibrated_zero_shot import CalibratedZeroShotCompressor
 from auto_round.compressors.data_driven import DataDrivenCompressor
+from auto_round.compressors.diffusion_mixin import DiffusionMixin
 from auto_round.compressors.entry import AutoRound as NewAutoRound
 from auto_round.compressors.entry import _select_rtn_compressor_base_cls
 from auto_round.compressors.zero_shot import ZeroShotCompressor
@@ -226,11 +227,13 @@ def test_compat_entry_forwards_disabled_svdquant_smoothing(monkeypatch):
         nsamples=1,
         enable_svdquant=True,
         svdquant_smooth_enabled=False,
+        svdquant_smooth_max_calibration_calls=16,
     )
 
     configs = captured["config"] if isinstance(captured["config"], list) else [captured["config"]]
     svdquant_config = next(config for config in configs if isinstance(config, SVDQuantConfig))
     assert svdquant_config.smooth_enabled is False
+    assert svdquant_config.smooth_max_calibration_calls == 16
 
 
 def test_data_free_svdquant_rtn_routes_to_zero_shot(monkeypatch):
@@ -324,6 +327,44 @@ def test_calibrated_zero_shot_caches_only_each_block_group_entry():
         "blocks.0",
         "single_blocks.0",
     ]
+
+
+def test_calibrated_zero_shot_reuses_deterministic_selection_for_each_block_group():
+    compressor = CalibratedZeroShotCompressor.__new__(CalibratedZeroShotCompressor)
+    compressor._smooth_max_calibration_calls = 3
+    compressor.prepare_calibration_call_selection(total_calls=10)
+
+    first_group = [index for index in range(10) if compressor.should_cache_calibration_call("blocks.0")]
+    second_group = [index for index in range(10) if compressor.should_cache_calibration_call("single_blocks.0")]
+
+    assert first_group == [0, 4, 9]
+    assert second_group == first_group
+
+
+def test_calibrated_zero_shot_resets_call_counters_for_new_collection():
+    compressor = CalibratedZeroShotCompressor.__new__(CalibratedZeroShotCompressor)
+    compressor._smooth_max_calibration_calls = 2
+    compressor.prepare_calibration_call_selection(total_calls=4)
+    first = [index for index in range(4) if compressor.should_cache_calibration_call("blocks.0")]
+
+    compressor.prepare_calibration_call_selection(total_calls=4)
+    second = [index for index in range(4) if compressor.should_cache_calibration_call("blocks.0")]
+
+    assert first == [0, 3]
+    assert second == first
+
+
+def test_diffusion_prepares_call_selection_from_prompt_batches_and_steps():
+    compressor = DiffusionMixin.__new__(DiffusionMixin)
+    compressor.nsamples = 10
+    compressor.batch_size = 4
+    compressor.num_inference_steps = 20
+    prepared = []
+    compressor.prepare_calibration_call_selection = prepared.append
+
+    compressor._prepare_calibration_call_selection()
+
+    assert prepared == [60]
 
 
 def test_entry_warns_and_drops_unsupported_kwargs(monkeypatch, tiny_opt_model_path):

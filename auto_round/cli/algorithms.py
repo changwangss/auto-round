@@ -131,6 +131,7 @@ class AlgorithmHandler(ABC):
                     rank=getattr(args, "svdquant_rank", 32),
                     smooth_enabled=getattr(args, "svdquant_smooth_enabled", False),
                     smooth_num_grids=getattr(args, "svdquant_smooth_num_grids", 20),
+                    smooth_max_calibration_calls=getattr(args, "svdquant_smooth_max_calibration_calls", 128),
                     target_modules=getattr(args, "svdquant_target_modules", None),
                     exclude_modules=getattr(args, "svdquant_exclude_modules", None),
                     low_rank_dtype=getattr(args, "svdquant_low_rank_dtype", "bf16"),

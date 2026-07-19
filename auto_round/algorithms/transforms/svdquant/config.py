@@ -31,6 +31,7 @@ class SVDQuantConfig(QuantizationConfig):
         rank: int = 32,
         smooth_enabled: bool = False,
         smooth_num_grids: int = 20,
+        smooth_max_calibration_calls: int = 128,
         target_modules: list[str] | tuple[str, ...] | str | None = None,
         exclude_modules: list[str] | tuple[str, ...] | str | None = None,
         low_rank_dtype: str = "bf16",
@@ -50,6 +51,11 @@ class SVDQuantConfig(QuantizationConfig):
             raise ValueError(
                 f"`smooth_num_grids` must be an integer greater than or equal to 2, got {smooth_num_grids!r}"
             )
+        if type(smooth_max_calibration_calls) is not int or smooth_max_calibration_calls < 1:
+            raise ValueError(
+                "`smooth_max_calibration_calls` must be a positive integer, "
+                f"got {smooth_max_calibration_calls!r}"
+            )
         if smooth_eps <= 0:
             raise ValueError(f"`smooth_eps` must be positive, got {smooth_eps!r}")
         if type(residual_iters) is not int or residual_iters < 1:
@@ -63,6 +69,7 @@ class SVDQuantConfig(QuantizationConfig):
         self.rank = rank
         self.smooth_enabled = smooth_enabled
         self.smooth_num_grids = smooth_num_grids
+        self.smooth_max_calibration_calls = smooth_max_calibration_calls
         self.target_modules = _normalize_patterns(target_modules)
         self.exclude_modules = _normalize_patterns(exclude_modules)
         self.low_rank_dtype = low_rank_dtype
@@ -77,6 +84,7 @@ class SVDQuantConfig(QuantizationConfig):
         return (
             f"SVDQuantConfig(rank={self.rank}, smooth_enabled={self.smooth_enabled!r}, "
             f"smooth_num_grids={self.smooth_num_grids}, "
+            f"smooth_max_calibration_calls={self.smooth_max_calibration_calls}, "
             f"low_rank_dtype={self.low_rank_dtype!r}, "
             f"target_modules={self.target_modules}, exclude_modules={self.exclude_modules}, "
             f"residual_iters={self.residual_iters}, residual_early_stop={self.residual_early_stop!r}, "

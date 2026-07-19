@@ -35,8 +35,16 @@ With smoothing disabled, `smooth` and `smooth_orig` are exact identity vectors.
 - `residual_iters=1`: one SVD decomposition. The residual is quantized by the normal
   downstream AutoRound flow or during export.
 - `residual_iters>1`: each additional outer iteration applies AutoRound RTN QDQ to
-  the current residual, computes the remaining error, and updates a fixed-rank SVD
-  branch.
+  the current residual and updates a fixed-rank SVD branch. In no-smooth mode, candidate
+  selection uses weight reconstruction error. With smoothing enabled, it reuses the
+  bounded calibration calls and selects candidates by evaluation-module output SSE.
+
+Smooth residual early stop follows the DeepCompressor rule: a candidate with output error
+less than or equal to the best error becomes the new best and iteration continues; the
+first finite candidate with greater error stops the loop. `residual_iters` remains the hard
+maximum, and 100 matches DeepCompressor's SVDQuant preset. Candidate outputs are scored one
+call at a time and immediately released, so iteration count increases runtime but does not
+multiply persistent calibration memory.
 
 Residual outer iteration uses RTN QDQ by design for both RTN and SignRound pipelines.
 `--algorithm` independently selects the final downstream residual quantizer: RTN or
@@ -54,12 +62,22 @@ rounding, residual RTN QDQ, and the registered parent module's output MSE. Flux 
 projections share one input scale and one low-rank down factor; single-stream Q/K/V and
 `proj_mlp` are searched together because they consume the same normalized input.
 
-The search captures all samples already scheduled by the current AutoRound block
-calibration context and replays the existing block batches. Its buffers live only for
-the current block and are released after scale selection or on failure. The selected
-runtime tensor is `smooth = 1 / scale`. Flux export preserves shared QKV down/smooth
-tensors directly, and splits single-stream `proj_out` residual/down/smooth tensors by
-input columns without replacing the selected scale with identity.
+The diffusion pipeline still executes the complete prompt and denoising-step trajectory,
+but the initial CPU block cache retains a deterministic uniform sample of at most
+`smooth_max_calibration_calls` transformer calls. The Python API and CLI default is 128;
+use `--svdquant_smooth_max_calibration_calls 16` on the 120 GiB RAM machine. If the full
+trajectory contains no more than the limit, every call is retained. Otherwise the sample
+includes the first and last calls and uniformly spans the calls between them.
+
+Calls not selected for retention still execute the original Transformer forward and are
+not copied to CPU. Each FLUX block-group entry uses the same selected call indices. The
+subsequent streaming block context therefore contains at most K calls, and the existing
+smooth hook replays and retains at most those K calls without a second independent sample.
+Its buffers live only for the current block and are released after scale selection or on
+failure. The selected runtime tensor is `smooth = 1 / scale`. Flux export preserves shared
+QKV down/smooth tensors directly, and splits single-stream `proj_out`
+residual/down/smooth tensors by input columns without replacing the selected scale with
+identity.
 
 ### Calibrated Zero-Shot Scheduling
 
@@ -86,15 +104,22 @@ count from approximately:
 57 * nsamples * num_inference_steps
 ```
 
-to:
+to, before bounded call sampling:
 
 ```text
 2 block-group entries * nsamples * num_inference_steps
 ```
 
 The two entries correspond to `transformer_blocks` and `single_transformer_blocks`.
-This does not reduce the number of smooth candidates or calibration examples evaluated
-by each layer; it removes the need to retain every layer's inputs simultaneously.
+With the bounded sampler, the retained count is at most:
+
+```text
+2 block-group entries * smooth_max_calibration_calls
+```
+
+This does not reduce the number of smooth candidates. It bounds the calibration calls
+evaluated by each candidate and removes the need to retain every layer's inputs
+simultaneously.
 
 FLUX `transformer_blocks` are dual-stream blocks. Their FP interface consumes and returns
 both `encoder_hidden_states` and `hidden_states`. Streaming must preserve both outputs:
@@ -131,11 +156,13 @@ For a quality-oriented smooth run, add:
 --num_inference_steps 10
 --enable_svdquant_smooth
 --svdquant_smooth_num_grids 20
+--svdquant_smooth_max_calibration_calls 16
 ```
 
-For diffusion calibration each layer evaluates roughly `nsamples * num_inference_steps`
-block inputs, so the command above evaluates about 320 inputs per layer. Use a smaller grid,
-sample count, and denoising-step count only for smoke validation. Smooth search performs
+For diffusion calibration, the full trajectory above executes roughly
+`nsamples * num_inference_steps` Transformer calls, but each layer's smooth search evaluates
+at most `smooth_max_calibration_calls` retained calls. Use a smaller retained-call limit,
+grid, sample count, and denoising-step count for smoke validation. Smooth search performs
 `2 * num_grids - 1` temporary grouped decompositions in addition to the final
 `svdquant_residual_iters` decomposition loop, so it is substantially slower than the
 no-smooth command.

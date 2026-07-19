@@ -64,6 +64,7 @@ _COMPAT_KWARGS = {
     "svdquant_rank",
     "svdquant_smooth_enabled",
     "svdquant_smooth_num_grids",
+    "svdquant_smooth_max_calibration_calls",
     "svdquant_target_modules",
     "svdquant_exclude_modules",
     "svdquant_low_rank_dtype",
