@@ -194,8 +194,12 @@ def replace_forward_with_hooks(state) -> None:
 
     def register_hook(n, m, hook_handles):
         if n in state.to_cached_layers and type(m) not in SUPPORTED_LAYER_TYPES:  # block
-            m.orig_forward = m.forward
-            m.forward = partial(state._get_block_forward_func(n), m)
+            replacement_attr = (
+                "_old_forward" if hasattr(m, "_hf_hook") and callable(getattr(m, "_old_forward", None)) else "forward"
+            )
+            m._autoround_replaced_forward_attr = replacement_attr
+            m.orig_forward = getattr(m, replacement_attr)
+            setattr(m, replacement_attr, partial(state._get_block_forward_func(n), m))
         elif n in state.to_cached_layers:  # linear / conv1d layer
             hook_func = state._get_cache_data_hook_for_layer(n)
             hook_handle = m.register_forward_hook(hook_func)
