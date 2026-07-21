@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import auto_round.export.svdquant_mxfp4 as codec_module
-from auto_round.data_type.mxfp import quant_element, quant_mx
+from auto_round.data_type.mxfp import quant_element, quant_mx_rceil
 from auto_round.export.svdquant_mxfp4 import (
     NunchakuMXFP4Packer,
     PackedMXFP4,
@@ -95,7 +95,7 @@ def test_pack_residual_returns_immutable_aligned_physical_tensors():
 def test_pack_unpack_residual_matches_autoround_rtn_qdq(shape):
     generator = torch.Generator().manual_seed(20260713)
     weight = torch.randn(shape, generator=generator, dtype=torch.float32) * 3
-    expected, _, _ = quant_mx(weight, bits=4, group_size=32, data_type="mx_fp4e2m1")
+    expected, _, _ = quant_mx_rceil(weight, bits=4, group_size=32, data_type="mx_fp4e2m1")
     packer = NunchakuMXFP4Packer()
 
     packed = packer.pack_residual(weight)
@@ -361,7 +361,7 @@ def test_e2m1_group_aligned_scale_rank_wins_over_broadcast_collision():
 
 def test_e2m1_group_size_32_codec_matches_autoround_quant_mx_qdq():
     weight = torch.linspace(-7.0, 7.0, steps=3 * 64, dtype=torch.float32).reshape(3, 64)
-    expected, shared_exponent, _ = quant_mx(
+    expected, shared_exponent, _ = quant_mx_rceil(
         weight,
         bits=4,
         group_size=32,

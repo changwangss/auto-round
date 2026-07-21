@@ -16,6 +16,7 @@ from auto_round.algorithms.pipeline import DiffusionBlockIO, QuantizationPipelin
 from auto_round.algorithms.quantization import registry as _r
 from auto_round.algorithms.quantization.rtn.quantizer import RTNQuantizer
 from auto_round.compressors.base import collect_user_scheme_overrides
+import auto_round.compressors.calibrated_zero_shot as calibrated_zero_shot_module
 from auto_round.compressors.calibrated_zero_shot import CalibratedZeroShotCompressor
 from auto_round.compressors.data_driven import DataDrivenCompressor
 from auto_round.compressors.diffusion_mixin import DiffusionMixin
@@ -352,6 +353,52 @@ def test_calibrated_zero_shot_resets_call_counters_for_new_collection():
 
     assert first == [0, 3]
     assert second == first
+
+
+def test_calibrated_zero_shot_logs_svdquant_provenance_once(monkeypatch):
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    messages = []
+    monkeypatch.setattr(logger, "info", lambda message, *args: messages.append(message % args))
+    monkeypatch.setattr(calibrated_zero_shot_module, "_source_checkout_commit", lambda: "abc123")
+    compressor = CalibratedZeroShotCompressor.__new__(CalibratedZeroShotCompressor)
+    compressor._provenance_configs = [
+        SVDQuantConfig(
+            rank=32,
+            smooth_enabled=True,
+            smooth_num_grids=20,
+            smooth_max_calibration_calls=16,
+            residual_iters=100,
+            residual_early_stop=True,
+        )
+    ]
+    compressor._provenance_model_source = "/models/flux"
+    compressor._calibration_state = SimpleNamespace(dataset="/data/coco2017.tsv", nsamples=128)
+    compressor.num_inference_steps = 50
+
+    compressor._log_svdquant_provenance()
+    compressor._log_svdquant_provenance()
+
+    assert len(messages) == 1
+    assert "model=/models/flux" in messages[0]
+    assert "dataset=/data/coco2017.tsv" in messages[0]
+    assert "nsamples=128" in messages[0]
+    assert "diffusion_steps=50" in messages[0]
+    assert "smooth_max_calibration_calls=16" in messages[0]
+    assert "smooth_num_grids=20" in messages[0]
+    assert "rank=32" in messages[0]
+    assert "residual_iters=100" in messages[0]
+    assert "residual_early_stop=True" in messages[0]
+    assert "source_commit=abc123" in messages[0]
+
+
+def test_source_checkout_commit_falls_back_to_unknown(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(calibrated_zero_shot_module.subprocess, "run", _raise)
+
+    assert calibrated_zero_shot_module._source_checkout_commit() == "unknown"
 
 
 def test_diffusion_prepares_call_selection_from_prompt_batches_and_steps():

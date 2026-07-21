@@ -5,14 +5,65 @@ import pytest
 import torch
 
 import auto_round.algorithms.transforms.svdquant.residual as residual_module
-from auto_round.algorithms.transforms.svdquant.residual import ResidualQuantScheme, rtn_qdq_residual
+from auto_round.algorithms.transforms.svdquant.residual import (
+    ActivationQuantScheme,
+    ResidualQuantScheme,
+    rtn_qdq_activation,
+    rtn_qdq_residual,
+)
 from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
-from auto_round.data_type.mxfp import quant_mx
-from auto_round.data_type.utils import get_quant_func
+from auto_round.data_type.mxfp import quant_mx_rceil
 
 
 def _deterministic_weight(dtype=torch.float32):
     return torch.linspace(-3.0, 3.0, steps=3 * 64, dtype=dtype).reshape(3, 64)
+
+
+def _deterministic_activation(dtype=torch.float32):
+    return torch.linspace(-4.0, 4.0, steps=2 * 3 * 64, dtype=dtype).reshape(2, 3, 64)
+
+
+def test_rtn_qdq_activation_preserves_tensor_contract():
+    activation = _deterministic_activation(dtype=torch.bfloat16)
+    scheme = ActivationQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=32, sym=True)
+
+    qdq = rtn_qdq_activation(activation, scheme)
+
+    assert qdq.shape == activation.shape
+    assert qdq.dtype == activation.dtype
+    assert qdq.device == activation.device
+    assert torch.isfinite(qdq).all()
+
+
+def test_rtn_qdq_activation_matches_registered_quant_function():
+    activation = _deterministic_activation()
+    scheme = ActivationQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=32, sym=True)
+
+    expected, _, _ = quant_mx_rceil(
+        tensor=activation,
+        bits=4,
+        group_size=32,
+        data_type="mx_fp4e2m1",
+    )
+
+    torch.testing.assert_close(rtn_qdq_activation(activation, scheme), expected)
+
+
+@pytest.mark.parametrize("group_size", [16, 64, (1, 32)])
+def test_rtn_qdq_activation_rejects_non_deployable_mxfp4_group_size(group_size):
+    scheme = ActivationQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=group_size, sym=True)
+
+    with pytest.raises(ValueError, match="activation.*group_size"):
+        rtn_qdq_activation(_deterministic_activation(), scheme)
+
+
+def test_rtn_qdq_activation_uses_nunchaku_ue8m0_ceil_scale():
+    activation = torch.tensor([[7.9] + [0.0] * 31])
+    scheme = ActivationQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=32, sym=True)
+
+    qdq = rtn_qdq_activation(activation, scheme)
+
+    assert qdq[0, 0].item() == 8.0
 
 
 def test_rtn_qdq_residual_preserves_tensor_contract():
@@ -30,38 +81,29 @@ def test_rtn_qdq_residual_preserves_tensor_contract():
 def test_rtn_qdq_residual_matches_registered_quant_function():
     weight = _deterministic_weight(dtype=torch.float16)
     scheme = ResidualQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=32, sym=True)
-    quant_func, resolved_dtype = get_quant_func(
-        dtype=scheme.data_type,
-        bits=scheme.bits,
-        sym=scheme.sym,
-        disable_opt_rtn=True,
-        group_size=scheme.group_size,
-        iters=0,
-    )
-
-    expected, _, _ = quant_func(
+    expected, _, _ = quant_mx_rceil(
         tensor=weight,
         bits=scheme.bits,
         group_size=scheme.group_size,
-        data_type=resolved_dtype.removeprefix("rtn_"),
+        data_type="mx_fp4e2m1",
     )
 
     torch.testing.assert_close(rtn_qdq_residual(weight, scheme), expected)
 
 
-def test_rtn_qdq_residual_passes_exact_mxfp4_dtype_to_quant_mx(monkeypatch):
+def test_rtn_qdq_residual_passes_exact_mxfp4_dtype_to_rceil_quant_mx(monkeypatch):
     calls = []
 
     def quant_mx_spy(*args, **kwargs):
         calls.append(kwargs["data_type"])
-        return quant_mx(*args, **kwargs)
+        return quant_mx_rceil(*args, **kwargs)
 
-    monkeypatch.setitem(QUANT_FUNC_WITH_DTYPE, "mx_fp4e2m1", quant_mx_spy)
+    monkeypatch.setitem(QUANT_FUNC_WITH_DTYPE, "mx_fp4e2m1_rceil", quant_mx_spy)
     scheme = ResidualQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=32, sym=True)
 
     rtn_qdq_residual(_deterministic_weight(), scheme)
 
-    assert calls == ["mx_fp4e2m1"]
+    assert calls == ["mx_fp4e2m1_rceil"]
 
 
 @pytest.mark.parametrize("data_type", ["mx_fp4", "mx_fp4e2m1"])
@@ -81,7 +123,7 @@ def test_rtn_qdq_residual_rejects_non_deployable_mxfp4_group_size(data_type, gro
 
 def test_rtn_qdq_residual_applies_group_size_to_resolved_mxfp4_dtype(monkeypatch):
     def resolve_as_mxfp4(**kwargs):
-        return quant_mx, "mx_fp4"
+        return quant_mx_rceil, "mx_fp4"
 
     monkeypatch.setattr(residual_module, "get_quant_func", resolve_as_mxfp4)
     scheme = ResidualQuantScheme(data_type="registry_alias", bits=4, group_size=16, sym=True)
@@ -146,7 +188,7 @@ def test_rtn_qdq_residual_rejects_non_finite_quantizer_result(monkeypatch):
     def non_finite_quantizer(tensor, **kwargs):
         return torch.full_like(tensor, torch.inf), None, None
 
-    monkeypatch.setitem(QUANT_FUNC_WITH_DTYPE, "mx_fp4e2m1", non_finite_quantizer)
+    monkeypatch.setitem(QUANT_FUNC_WITH_DTYPE, "mx_fp4e2m1_rceil", non_finite_quantizer)
     scheme = ResidualQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=32, sym=True)
 
     with pytest.raises(ValueError, match="non-finite"):
@@ -157,7 +199,7 @@ def test_rtn_qdq_residual_rejects_quantizer_result_on_different_device(monkeypat
     def wrong_device_quantizer(tensor, **kwargs):
         return torch.empty(tensor.shape, dtype=tensor.dtype, device="meta"), None, None
 
-    monkeypatch.setitem(QUANT_FUNC_WITH_DTYPE, "mx_fp4e2m1", wrong_device_quantizer)
+    monkeypatch.setitem(QUANT_FUNC_WITH_DTYPE, "mx_fp4e2m1_rceil", wrong_device_quantizer)
     scheme = ResidualQuantScheme(data_type="mx_fp4e2m1", bits=4, group_size=32, sym=True)
 
     with pytest.raises(ValueError, match="device"):

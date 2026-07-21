@@ -28,6 +28,15 @@ class SmoothCandidate:
     scale: torch.Tensor
 
 
+@dataclass(frozen=True)
+class SmoothScaleStats:
+    minimum: float
+    maximum: float
+    ratio: float
+    below_min_count: int
+    above_max_count: int
+
+
 def build_alpha_beta_candidates(num_grids: int) -> list[tuple[float, float]]:
     if type(num_grids) is not int or num_grids < 2:
         raise ValueError(f"`num_grids` must be an integer greater than or equal to 2, got {num_grids!r}")
@@ -48,6 +57,7 @@ def build_smooth_scale(
     w_span: torch.Tensor,
     alpha: float,
     beta: float,
+    eps: float | None = None,
 ) -> torch.Tensor:
     if not 0.0 <= alpha <= 1.0 or not 0.0 <= beta <= 1.0:
         raise ValueError(f"Smooth alpha and beta must be in [0, 1], got alpha={alpha!r}, beta={beta!r}")
@@ -56,6 +66,11 @@ def build_smooth_scale(
 
     x_span = x_span.to(torch.float32)
     w_span = w_span.to(device=x_span.device, dtype=torch.float32)
+    if eps is not None:
+        if eps <= 0:
+            raise ValueError(f"`eps` must be positive, got {eps!r}")
+        x_span = x_span.clamp_min(eps)
+        w_span = w_span.clamp_min(eps)
     if alpha == 0.0 and beta == 0.0:
         return torch.ones_like(x_span)
 
@@ -71,6 +86,44 @@ def build_smooth_scale(
     if not torch.isfinite(scale).all():
         scale.fill_(1)
     return scale
+
+
+def validate_smooth_scale_for_deployment(
+    scale: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    module_name: str,
+) -> torch.Tensor:
+    """Validate a smooth scale after materialization in its deployment dtype."""
+    deployed = scale.to(dtype=dtype)
+    reciprocal = deployed.reciprocal()
+    if (
+        not bool(torch.isfinite(deployed).all())
+        or not bool((deployed > 0).all())
+        or not bool(torch.isfinite(reciprocal).all())
+        or not bool((reciprocal > 0).all())
+    ):
+        raise ValueError(f"SVDQuant smooth scale is not deployable for {module_name!r} in dtype {dtype}.")
+    return deployed
+
+
+def summarize_smooth_scale(
+    scale: torch.Tensor,
+    *,
+    low_threshold: float = 1e-3,
+    high_threshold: float = 20.0,
+) -> SmoothScaleStats:
+    values = scale.detach().to(device="cpu", dtype=torch.float32)
+    minimum = values.amin().item()
+    maximum = values.amax().item()
+    ratio = maximum / minimum
+    return SmoothScaleStats(
+        minimum=minimum,
+        maximum=maximum,
+        ratio=ratio,
+        below_min_count=int((values < low_threshold).sum().item()),
+        above_max_count=int((values > high_threshold).sum().item()),
+    )
 
 
 _CandidateT = TypeVar("_CandidateT")

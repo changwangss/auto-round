@@ -85,6 +85,13 @@ def _all_targets(_name: str, module: torch.nn.Module) -> bool:
     return isinstance(module, torch.nn.Linear)
 
 
+def _set_activation_quant_attrs(module: torch.nn.Module) -> None:
+    module.act_data_type = "int"
+    module.act_bits = 16
+    module.act_group_size = 2
+    module.act_sym = True
+
+
 def test_flux_double_block_discovers_expected_groups():
     block = FluxTransformerBlock()
     block.global_name = "transformer_blocks.7"
@@ -253,6 +260,7 @@ def test_flux_qkv_search_uses_parent_output_and_final_shared_down(monkeypatch):
         projection.bits = 4
         projection.group_size = 2
         projection.sym = True
+        _set_activation_quant_attrs(projection)
         projection.global_name = f"transformer_blocks.0.attn.{name}"
 
     hidden_states = torch.tensor([[[1.0, -2.0], [0.5, 3.0]]])
@@ -277,6 +285,7 @@ def test_flux_qkv_search_uses_parent_output_and_final_shared_down(monkeypatch):
             best_error = error
 
     monkeypatch.setattr(residual_module, "rtn_qdq_residual", lambda residual, _scheme: torch.round(residual))
+    monkeypatch.setattr(residual_module, "rtn_qdq_activation", lambda activation, scheme: activation)
     transform = SVDQuantTransform(
         SVDQuantConfig(
             rank=1,
@@ -316,9 +325,11 @@ def test_flux_smooth_search_restores_bfloat16_evaluation_dtype(monkeypatch):
         projection.bits = 4
         projection.group_size = 2
         projection.sym = True
+        _set_activation_quant_attrs(projection)
         projection.global_name = f"{block.global_name}.{name}"
 
     monkeypatch.setattr(residual_module, "rtn_qdq_residual", lambda residual, _scheme: torch.round(residual))
+    monkeypatch.setattr(residual_module, "rtn_qdq_activation", lambda activation, scheme: activation)
     transform = SVDQuantTransform(
         SVDQuantConfig(
             rank=1,
@@ -384,6 +395,7 @@ def test_group_residual_early_stop_continues_on_equal_error_and_stops_when_worse
     projection.bits = 4
     projection.group_size = 2
     projection.sym = True
+    _set_activation_quant_attrs(projection)
     group = discover_smooth_search_groups(block, _all_targets)[0]
     calibration = SmoothGroupCalibration(group=group)
     transform = SVDQuantTransform(
@@ -402,6 +414,7 @@ def test_group_residual_early_stop_continues_on_equal_error_and_stops_when_worse
     errors = iter((3.0, 3.0, 4.0, 2.0))
 
     def fake_score(_calibration, wrappers, _block, _local_names):
+        assert wrappers[0].activation_qdq is not None
         scored_down_values.append(wrappers[0].lora_down.weight[0, 0].item())
         return next(errors)
 

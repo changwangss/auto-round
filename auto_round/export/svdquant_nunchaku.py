@@ -444,10 +444,19 @@ def _serialize_export_records(
 ) -> dict[str, torch.Tensor]:
     tensors: dict[str, torch.Tensor] = {}
     for record in records:
+        if not bool((record.smooth > 0).all()) or not bool((record.smooth_orig > 0).all()):
+            raise ValueError(f"{record.prefix} smooth tensors must contain only positive values")
+
+        # SVDQuantLinear multiplies both branches' input by ``smooth``. Nunchaku
+        # divides only the residual input by its smooth factor and applies the
+        # low-rank branch to the original input, so convert between coordinates.
+        runtime_smooth = record.smooth.to(torch.float64).reciprocal()
+        runtime_smooth_orig = record.smooth_orig.to(torch.float64).reciprocal()
+        runtime_lora_down = record.lora_down.to(torch.float64) * record.smooth.to(torch.float64).unsqueeze(0)
         high_precision = {
-            "smooth": pack_nunchaku_16bit_vector(record.smooth.to(config.low_rank_dtype)),
-            "smooth_orig": pack_nunchaku_16bit_vector(record.smooth_orig.to(config.low_rank_dtype)),
-            "lora_down": pack_lowrank_weight(record.lora_down.to(config.low_rank_dtype), down=True),
+            "smooth": pack_nunchaku_16bit_vector(runtime_smooth.to(config.low_rank_dtype)),
+            "smooth_orig": pack_nunchaku_16bit_vector(runtime_smooth_orig.to(config.low_rank_dtype)),
+            "lora_down": pack_lowrank_weight(runtime_lora_down.to(config.low_rank_dtype), down=True),
             "lora_up": pack_lowrank_weight(record.lora_up.to(config.low_rank_dtype), down=False),
             "bias": pack_nunchaku_16bit_vector(
                 torch.zeros(

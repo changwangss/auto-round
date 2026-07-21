@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import torch
 
 
@@ -24,14 +26,17 @@ class SVDQuantLinear(torch.nn.Module):
         lora_down: torch.nn.Linear,
         lora_up: torch.nn.Linear,
         smooth: torch.Tensor,
+        activation_qdq: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
         super().__init__()
         self.residual_linear = residual_linear
         self.lora_down = lora_down
         self.lora_up = lora_up
+        self.activation_qdq = activation_qdq
         self.register_buffer("smooth", smooth.detach().clone())
 
     def forward(self, x):
         smooth = self.smooth.to(device=x.device, dtype=x.dtype)
         x_hat = x * smooth
-        return self.residual_linear(x_hat) + self.lora_up(self.lora_down(x_hat))
+        residual_input = x_hat if self.activation_qdq is None else self.activation_qdq(x_hat)
+        return self.residual_linear(residual_input) + self.lora_up(self.lora_down(x_hat))

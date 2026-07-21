@@ -19,6 +19,7 @@ import torch
 from auto_round.data_type.utils import get_quant_func
 
 _FIXED_MXFP4_DTYPES = frozenset({"mx_fp4", "mx_fp4e2m1"})
+_MXFP4_ALIASES = frozenset({"mx_fp", *_FIXED_MXFP4_DTYPES})
 
 
 def _validate_scheme_values(scheme):
@@ -69,12 +70,26 @@ class ResidualQuantScheme:
         _validate_scheme_values(self)
 
 
-@torch.inference_mode()
-def rtn_qdq_residual(weight: torch.Tensor, scheme: ResidualQuantScheme) -> torch.Tensor:
-    """Apply the registered RTN quantize-dequantize function to a residual."""
+@dataclass(frozen=True)
+class ActivationQuantScheme:
+    """Activation quantization settings for stateless calibration QDQ."""
+
+    data_type: str | None = None
+    bits: int | None = None
+    group_size: int | tuple[int, int] | None = None
+    sym: bool | None = None
+
+    def __post_init__(self) -> None:
+        _validate_scheme_values(self)
+
+
+def _rtn_qdq_tensor(tensor: torch.Tensor, scheme, *, tensor_name: str) -> torch.Tensor:
     values = _validate_scheme_values(scheme)
+    requested_dtype = values["data_type"]
+    if values["bits"] == 4 and requested_dtype in _MXFP4_ALIASES:
+        requested_dtype = f"{requested_dtype}_rceil"
     quant_func, resolved_dtype = get_quant_func(
-        dtype=values["data_type"],
+        dtype=requested_dtype,
         bits=values["bits"],
         sym=values["sym"],
         disable_opt_rtn=True,
@@ -82,31 +97,45 @@ def rtn_qdq_residual(weight: torch.Tensor, scheme: ResidualQuantScheme) -> torch
         iters=0,
     )
     logical_dtype = resolved_dtype.removeprefix("rtn_")
-    if logical_dtype in _FIXED_MXFP4_DTYPES and (
+    resolved_base_dtype = logical_dtype.removesuffix("_rceil")
+    if resolved_base_dtype in _MXFP4_ALIASES and values["bits"] == 4 and (
         not isinstance(values["group_size"], int)
         or isinstance(values["group_size"], bool)
         or values["group_size"] != 32
     ):
         raise ValueError(
-            "Deployable MXFP4 residual QDQ requires scalar group_size=32; " f"got group_size={values['group_size']!r}."
+            f"Deployable MXFP4 {tensor_name} QDQ requires scalar group_size=32; "
+            f"got group_size={values['group_size']!r}."
         )
 
     qdq, _, _ = quant_func(
-        tensor=weight,
+        tensor=tensor,
         bits=values["bits"],
         group_size=values["group_size"],
         data_type=logical_dtype,
     )
-    if qdq.shape != weight.shape or qdq.dtype != weight.dtype:
+    if qdq.shape != tensor.shape or qdq.dtype != tensor.dtype:
         raise ValueError(
-            "Residual RTN QDQ must preserve the input shape and dtype; "
+            f"{tensor_name.capitalize()} RTN QDQ must preserve the input shape and dtype; "
             f"got shape={tuple(qdq.shape)}, dtype={qdq.dtype}."
         )
-    if qdq.device != weight.device:
+    if qdq.device != tensor.device:
         raise ValueError(
-            "Residual RTN QDQ must preserve the input device; "
-            f"got input device={weight.device}, output device={qdq.device}."
+            f"{tensor_name.capitalize()} RTN QDQ must preserve the input device; "
+            f"got input device={tensor.device}, output device={qdq.device}."
         )
     if not torch.isfinite(qdq).all():
-        raise ValueError("Residual RTN QDQ produced non-finite values.")
+        raise ValueError(f"{tensor_name.capitalize()} RTN QDQ produced non-finite values.")
     return qdq
+
+
+@torch.inference_mode()
+def rtn_qdq_residual(weight: torch.Tensor, scheme: ResidualQuantScheme) -> torch.Tensor:
+    """Apply the registered RTN quantize-dequantize function to a residual."""
+    return _rtn_qdq_tensor(weight, scheme, tensor_name="residual")
+
+
+@torch.inference_mode()
+def rtn_qdq_activation(activation: torch.Tensor, scheme: ActivationQuantScheme) -> torch.Tensor:
+    """Apply deployment-compatible dynamic activation quantize-dequantize."""
+    return _rtn_qdq_tensor(activation, scheme, tensor_name="activation")

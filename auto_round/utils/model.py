@@ -1049,6 +1049,14 @@ def is_diffusion_model(model_or_path: Union[str, object], trust_remote_code: boo
         if is_gguf_model(model_or_path):
             return False
 
+        if os.path.isdir(model_or_path):
+            model_index = os.path.join(model_or_path, "model_index.json")
+            if os.path.isfile(model_index):
+                check_diffusers_installed()
+                return True
+            if os.path.isfile(os.path.join(model_or_path, "scheduler_config.json")):
+                return False
+
         # First check if it's a known diffusion pipeline by config/model_type
         # to avoid unnecessary imports and file checks for non-diffusion models, which can be time-consuming.
         try:

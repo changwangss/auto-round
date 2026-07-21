@@ -18,7 +18,7 @@
 
 1. Add failing tests for valid MXFP4 activation QDQ, missing attributes, invalid group size, and shape/dtype/device preservation.
 2. Run the focused tests and confirm failure.
-3. Add `ActivationQuantScheme` and `rtn_qdq_activation` using the registered AutoRound quantization function.
+3. Add `ActivationQuantScheme` and `rtn_qdq_activation` using the registered Nunchaku-compatible MXFP4 rceil quantization function.
 4. Run the focused tests and confirm success.
 
 ### Task 2: Deployment-Faithful Candidate Wrapper
@@ -59,6 +59,18 @@
 3. Emit the provenance before calibration/quantization starts.
 4. Run calibrated zero-shot and CLI forwarding tests.
 
+### Task 4a: Align Residual Export With Nunchaku UE8M0 Scaling
+
+**Files:**
+- Modify: `auto_round/algorithms/transforms/svdquant/residual.py`
+- Modify: `auto_round/export/svdquant_mxfp4.py`
+- Test: `test/test_cpu/algorithms/test_svdquant_residual.py`
+- Test: `test/test_cpu/export/test_svdquant_mxfp4.py`
+
+1. Use `quant_mx_rceil` for MXFP4 residual QDQ and onefile packing.
+2. Lock the scale rule with a fixed vector where `max_abs=7.9` must QDQ to `8.0`.
+3. Keep NVFP4 semantics separate because it uses group-16 E4M3 scales rather than MXFP4 group-32 UE8M0 scales.
+
 ### Task 5: Regression Verification
 
 **Files:**
@@ -73,4 +85,3 @@
 3. Run `git diff --check`.
 4. Confirm safetensors metadata generation is unchanged.
 5. Record the recommended FLUX ablation commands without launching a full quantization run.
-

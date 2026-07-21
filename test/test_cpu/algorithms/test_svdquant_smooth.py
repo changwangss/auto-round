@@ -89,6 +89,68 @@ def test_build_smooth_scale_falls_back_entire_scale_on_nonfinite_value():
     torch.testing.assert_close(scale, torch.ones(2))
 
 
+def test_build_smooth_scale_clamps_span_bases_with_epsilon():
+    from auto_round.algorithms.transforms.svdquant.smooth import build_smooth_scale
+
+    scale = build_smooth_scale(
+        torch.tensor([0.0, 4.0]),
+        torch.tensor([0.0, 1.0]),
+        alpha=0.5,
+        beta=0.5,
+        eps=1e-4,
+    )
+
+    torch.testing.assert_close(scale, torch.tensor([1.0, 2.0]))
+
+
+def test_validate_smooth_scale_for_deployment_rejects_nonfinite_reciprocal():
+    from auto_round.algorithms.transforms.svdquant.smooth import validate_smooth_scale_for_deployment
+
+    with pytest.raises(ValueError, match="deployable.*proj"):
+        validate_smooth_scale_for_deployment(
+            torch.tensor([1e-40, 1.0]),
+            dtype=torch.bfloat16,
+            module_name="transformer_blocks.0.proj",
+        )
+
+
+def test_summarize_smooth_scale_reports_range_and_extreme_counts():
+    from auto_round.algorithms.transforms.svdquant.smooth import summarize_smooth_scale
+
+    stats = summarize_smooth_scale(torch.tensor([5e-4, 1.0, 25.0]))
+
+    assert stats.minimum == pytest.approx(5e-4)
+    assert stats.maximum == 25.0
+    assert stats.ratio == pytest.approx(50_000.0)
+    assert stats.below_min_count == 1
+    assert stats.above_max_count == 1
+
+
+def test_selected_smooth_candidate_logs_statistics_and_extreme_warning(monkeypatch):
+    import auto_round.algorithms.transforms.svdquant.apply as apply_module
+    from auto_round.algorithms.transforms.svdquant.smooth import SmoothCandidate
+
+    info_messages = []
+    warning_messages = []
+    monkeypatch.setattr(apply_module.logger, "info", lambda message, *args: info_messages.append(message % args))
+    monkeypatch.setattr(
+        apply_module.logger,
+        "warning",
+        lambda message, *args: warning_messages.append(message % args),
+    )
+    candidate = SmoothCandidate(alpha=0.5, beta=0.5, scale=torch.tensor([5e-4, 1.0, 25.0]))
+
+    apply_module.SVDQuantTransform._log_selected_smooth_candidate("blocks.0.qkv", candidate, 1.25)
+
+    assert len(info_messages) == 1
+    assert "alpha=0.5 beta=0.5 error=1.25" in info_messages[0]
+    assert "scale_min=0.0005 scale_max=25" in info_messages[0]
+    assert "below_1e-3=1 above_20=1" in info_messages[0]
+    assert warning_messages == [
+        "SVDQuant smooth scale for blocks.0.qkv contains extreme values: below_1e-3=1 above_20=1"
+    ]
+
+
 def test_select_best_layer_candidate_prefers_later_exact_tie():
     from auto_round.algorithms.transforms.svdquant.smooth import select_best_layer_candidate
 

@@ -37,11 +37,16 @@ must use one identical activation scheme. Deployable MXFP4 requires 4 bits and
 group size 32. Missing or inconsistent attributes fail with a module-specific
 error instead of silently evaluating W4A16.
 
+Both weight and activation QDQ use the Nunchaku UE8M0 scale rule
+`ceil(log2(max_abs / 6))`. This differs from AutoRound's older
+`floor(log2(max_abs)) - 2` MXFP4 approximation and prevents calibration from
+optimizing a quantizer different from the exported Nunchaku kernel.
+
 ## Smooth Safeguards
 
 `smooth_eps` clamps activation and weight span bases before exponentiation.
-Candidates must remain finite and positive after conversion to the configured
-low-rank dtype, and their reciprocals must also remain finite and positive.
+Candidates must remain finite and positive after conversion to the projection
+deployment dtype, and their reciprocals must also remain finite and positive.
 No arbitrary fixed min/max clamp is introduced because it would diverge from
 the search objective.
 
@@ -67,4 +72,3 @@ fields to safetensors metadata.
 - Test provenance logging with and without a Git checkout.
 - Run existing SVDQuant, smooth adapter, calibrated zero-shot, CLI, and export
   regressions.
-

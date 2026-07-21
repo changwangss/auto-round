@@ -128,6 +128,38 @@ def test_svdquant_linear_matches_manual_reference():
     torch.testing.assert_close(layer(x), expected)
 
 
+def test_svdquant_linear_quantizes_only_residual_branch_input():
+    from auto_round.algorithms.transforms.svdquant.wrapper import SVDQuantLinear
+
+    residual = torch.nn.Linear(2, 1, bias=False)
+    lora_down = torch.nn.Linear(2, 1, bias=False)
+    lora_up = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        residual.weight.copy_(torch.tensor([[1.0, 1.0]]))
+        lora_down.weight.copy_(torch.tensor([[1.0, 2.0]]))
+        lora_up.weight.copy_(torch.tensor([[3.0]]))
+    seen = []
+
+    def activation_qdq(value):
+        seen.append(value.clone())
+        return torch.zeros_like(value)
+
+    layer = SVDQuantLinear(
+        residual,
+        lora_down,
+        lora_up,
+        smooth=torch.tensor([2.0, 0.5]),
+        activation_qdq=activation_qdq,
+    )
+    x = torch.tensor([[1.0, 4.0]])
+    x_hat = x * torch.tensor([2.0, 0.5])
+
+    actual = layer(x)
+
+    torch.testing.assert_close(seen[0], x_hat)
+    torch.testing.assert_close(actual, lora_up(lora_down(x_hat)))
+
+
 def test_svdquant_transform_replaces_linear_with_residual_branch():
     from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
     from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
@@ -199,6 +231,10 @@ def test_svdquant_enabled_smoothing_selects_low_rank_aware_grid_minimum(monkeypa
     layer.bits = 4
     layer.group_size = 2
     layer.sym = True
+    layer.act_data_type = "int"
+    layer.act_bits = 16
+    layer.act_group_size = 2
+    layer.act_sym = True
     layer.global_name = "model.layers.0.proj"
     x = torch.tensor([[1.0, -4.0], [-0.5, 2.0]])
     expected = layer(x)
@@ -233,6 +269,7 @@ def test_svdquant_enabled_smoothing_selects_low_rank_aware_grid_minimum(monkeypa
         return torch.round(residual)
 
     monkeypatch.setattr(residual_module, "rtn_qdq_residual", rounded_qdq)
+    monkeypatch.setattr(residual_module, "rtn_qdq_activation", lambda activation, scheme: activation)
 
     with transform.block_forward_hooks(ctx) as handles:
         assert len(handles) == 1

@@ -67,10 +67,11 @@ def test_default_collection_emits_runtime_layout_tensors_without_debug_residual(
     logical_up = model[0].lora_up.weight.detach().to(torch.bfloat16)
     unpacked_down = unpack_lowrank_weight(tensors["0.lora_down"], down=True)
     unpacked_up = unpack_lowrank_weight(tensors["0.lora_up"], down=False)
-    torch.testing.assert_close(unpacked_down[:3, :65], logical_down)
+    expected_runtime_down = logical_down * model[0].smooth.to(torch.bfloat16).unsqueeze(0)
+    torch.testing.assert_close(unpacked_down[:3, :65], expected_runtime_down)
     torch.testing.assert_close(unpacked_up[:7, :3], logical_up)
     torch.testing.assert_close(
-        unpack_nunchaku_16bit_vector(tensors["0.smooth"])[:65], model[0].smooth.to(torch.bfloat16)
+        unpack_nunchaku_16bit_vector(tensors["0.smooth"])[:65], model[0].smooth.reciprocal().to(torch.bfloat16)
     )
     torch.testing.assert_close(
         unpack_nunchaku_16bit_vector(tensors["0.bias"])[:7],
@@ -133,7 +134,7 @@ def test_adapter_maps_all_logical_source_records_with_model_level_visibility():
 
 def test_bias_and_smooth_vectors_match_layout_fixture_and_identity_padding():
     model = _toy_model(bias=False)
-    model[0].register_buffer("smooth_orig", torch.arange(65, dtype=torch.float32))
+    model[0].register_buffer("smooth_orig", torch.arange(1, 66, dtype=torch.float32))
 
     tensors = collect_svdquant_tensors(model)
 
@@ -141,7 +142,9 @@ def test_bias_and_smooth_vectors_match_layout_fixture_and_identity_padding():
     assert torch.count_nonzero(bias[:7]) == 0
     assert torch.equal(bias[7:], torch.ones_like(bias[7:]))
     smooth_orig = unpack_nunchaku_16bit_vector(tensors["0.smooth_orig"])
-    torch.testing.assert_close(smooth_orig[:65], torch.arange(65, dtype=torch.bfloat16))
+    torch.testing.assert_close(
+        smooth_orig[:65], torch.arange(1, 66, dtype=torch.float32).reciprocal().to(torch.bfloat16)
+    )
     assert torch.equal(smooth_orig[65:], torch.ones_like(smooth_orig[65:]))
     fixture = pack_nunchaku_16bit_vector(torch.arange(128, dtype=torch.float16))
     assert fixture[:32].tolist() == [

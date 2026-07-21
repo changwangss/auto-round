@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import torch
@@ -26,10 +27,13 @@ from auto_round.algorithms.registry import register_pipeline_member
 from auto_round.algorithms.transforms.base import BaseWeightTransformer
 from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
 from auto_round.algorithms.transforms.svdquant.smooth import (
+    SmoothCandidate,
     absmax_channel_span,
     build_alpha_beta_candidates,
     build_smooth_scale,
     select_best_layer_candidate,
+    summarize_smooth_scale,
+    validate_smooth_scale_for_deployment,
 )
 from auto_round.algorithms.transforms.svdquant.smooth_adapters import (
     SmoothSearchGroup,
@@ -230,16 +234,48 @@ class SVDQuantTransform(BaseWeightTransformer):
             projection.weight.detach().to(device=device, dtype=torch.float32) for projection in group.projections
         ]
         w_span = absmax_channel_span(torch.cat(weights, dim=0), 1).cpu()
-        scored = []
+        scored: list[tuple[tuple[SmoothCandidate, float], float]] = []
         for alpha, beta in build_alpha_beta_candidates(self.config.smooth_num_grids):
-            scale = build_smooth_scale(x_span, w_span, alpha, beta)
+            scale = build_smooth_scale(x_span, w_span, alpha, beta, eps=self.config.smooth_eps)
             try:
+                scale = validate_smooth_scale_for_deployment(
+                    scale,
+                    dtype=group.projections[0].weight.dtype,
+                    module_name=group.key,
+                ).to(torch.float32)
                 error = self._score_group_candidate(calibration, scale, block, local_names)
             except (RuntimeError, ValueError, TypeError) as exc:
                 logger.debug("Skipping SVDQuant smooth candidate (%s, %s) for %s: %s", alpha, beta, group.key, exc)
                 error = float("inf")
-            scored.append((scale, error))
-        return select_best_layer_candidate(scored, module_name=group.key)
+            candidate = SmoothCandidate(alpha=alpha, beta=beta, scale=scale)
+            scored.append(((candidate, error), error))
+        selected, error = select_best_layer_candidate(scored, module_name=group.key)
+        self._log_selected_smooth_candidate(group.key, selected, error)
+        return selected.scale
+
+    @staticmethod
+    def _log_selected_smooth_candidate(module_name: str, candidate: SmoothCandidate, error: float) -> None:
+        stats = summarize_smooth_scale(candidate.scale)
+        logger.info(
+            "SVDQuant smooth selected for %s: alpha=%.6g beta=%.6g error=%.6g "
+            "scale_min=%.6g scale_max=%.6g scale_ratio=%.6g below_1e-3=%d above_20=%d",
+            module_name,
+            candidate.alpha,
+            candidate.beta,
+            error,
+            stats.minimum,
+            stats.maximum,
+            stats.ratio,
+            stats.below_min_count,
+            stats.above_max_count,
+        )
+        if stats.below_min_count or stats.above_max_count:
+            logger.warning(
+                "SVDQuant smooth scale for %s contains extreme values: below_1e-3=%d above_20=%d",
+                module_name,
+                stats.below_min_count,
+                stats.above_max_count,
+            )
 
     def _score_group_candidate(
         self,
@@ -317,7 +353,14 @@ class SVDQuantTransform(BaseWeightTransformer):
         for projection, weight, low_rank in zip(group.projections, weights, low_rank_parts):
             residual = (weight - low_rank).to(projection.weight.dtype)
             residuals.append(residual_module.rtn_qdq_residual(residual, self._residual_quant_scheme(projection)))
-        return self._build_group_wrappers(group, residuals, deployed_down, up_parts, scale)
+        return self._build_group_wrappers(
+            group,
+            residuals,
+            deployed_down,
+            up_parts,
+            scale,
+            activation_scheme=self._group_activation_quant_scheme(group),
+        )
 
     def _decompose_group(
         self,
@@ -377,6 +420,7 @@ class SVDQuantTransform(BaseWeightTransformer):
         best: tuple[torch.Tensor, torch.Tensor] | None = None
         best_error = float("inf")
         last_failure = "no finite candidate was produced"
+        activation_scheme = self._group_activation_quant_scheme(group)
         for iteration in range(1, self.config.residual_iters + 1):
             try:
                 _low_rank, down_weight, stacked_up = _truncated_svd(stacked - quantized_residual, rank)
@@ -398,6 +442,7 @@ class SVDQuantTransform(BaseWeightTransformer):
                     deployed_down,
                     up_parts,
                     scale,
+                    activation_scheme=activation_scheme,
                 )
                 error_value = self._score_group_wrappers(calibration, wrappers, block, local_names)
                 del qdq_residuals, wrappers
@@ -437,6 +482,7 @@ class SVDQuantTransform(BaseWeightTransformer):
         down_weight: torch.Tensor,
         up_parts: tuple[torch.Tensor, ...],
         scale: torch.Tensor,
+        activation_scheme: residual_module.ActivationQuantScheme | None = None,
     ) -> list[SVDQuantLinear]:
         wrappers = []
         low_rank_dtype = down_weight.dtype
@@ -463,7 +509,20 @@ class SVDQuantTransform(BaseWeightTransformer):
             self._mark_unquantized(lora_down)
             self._mark_unquantized(lora_up)
             self._copy_quant_attrs(projection, residual, suffix=".residual_linear")
-            wrappers.append(SVDQuantLinear(residual, lora_down, lora_up, smooth.to(projection.weight.dtype)))
+            activation_qdq = (
+                None
+                if activation_scheme is None
+                else partial(residual_module.rtn_qdq_activation, scheme=activation_scheme)
+            )
+            wrappers.append(
+                SVDQuantLinear(
+                    residual,
+                    lora_down,
+                    lora_up,
+                    smooth.to(projection.weight.dtype),
+                    activation_qdq=activation_qdq,
+                )
+            )
         return wrappers
 
     def _is_target(self, name: str, module: torch.nn.Module) -> bool:
@@ -613,6 +672,35 @@ class SVDQuantTransform(BaseWeightTransformer):
             raise ValueError(
                 f"Invalid residual quantization scheme for module {self._module_name(module)!r}: {exc}"
             ) from exc
+
+    def _activation_quant_scheme(self, module: torch.nn.Linear) -> residual_module.ActivationQuantScheme:
+        attributes = {
+            "data_type": "act_data_type",
+            "bits": "act_bits",
+            "group_size": "act_group_size",
+            "sym": "act_sym",
+        }
+        missing = [source for source in attributes.values() if not hasattr(module, source) or getattr(module, source) is None]
+        if missing:
+            raise ValueError(
+                f"SVDQuant activation-aware calibration requires act_data_type, act_bits, act_group_size, and "
+                f"act_sym for module {self._module_name(module)!r}; missing: {', '.join(missing)}."
+            )
+        try:
+            return residual_module.ActivationQuantScheme(
+                **{target: getattr(module, source) for target, source in attributes.items()}
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid activation quantization scheme for module {self._module_name(module)!r}: {exc}"
+            ) from exc
+
+    def _group_activation_quant_scheme(self, group: SmoothSearchGroup) -> residual_module.ActivationQuantScheme:
+        schemes = [self._activation_quant_scheme(projection) for projection in group.projections]
+        first = schemes[0]
+        if any(scheme != first for scheme in schemes[1:]):
+            raise ValueError(f"SVDQuant smooth group {group.key!r} has inconsistent activation quantization schemes.")
+        return first
 
     def _raise_if_nonfinite(self, module: torch.nn.Linear, iteration: int, *tensors: torch.Tensor) -> None:
         if not all(torch.isfinite(tensor).all() for tensor in tensors):

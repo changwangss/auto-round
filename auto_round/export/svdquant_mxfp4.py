@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 import torch
 
-from auto_round.data_type.mxfp import quant_element, quant_mx
+from auto_round.data_type.mxfp import quant_element, quant_mx_rceil
 
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _SUPPORTED_DECODE_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
@@ -189,7 +189,12 @@ class NunchakuMXFP4Packer:
         k_group_padded = self._ceil_to(k, group_size)
         k_padded = self._ceil_to(k_group_padded, self.mem_k * self.num_k_unrolls)
 
-        qdq, shared_exponent, _ = quant_mx(weight, bits=4, group_size=group_size, data_type="mx_fp4e2m1")
+        qdq, shared_exponent, _ = quant_mx_rceil(
+            weight,
+            bits=4,
+            group_size=group_size,
+            data_type="mx_fp4e2m1",
+        )
         num_logical_groups = k_group_padded // group_size
         scales = torch.exp2(shared_exponent.reshape(n, num_logical_groups).to(torch.float32))
 

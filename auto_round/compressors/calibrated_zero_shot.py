@@ -6,6 +6,8 @@
 #
 #    http://www.apache.org/licenses/LICENSE-2.0
 from contextlib import ExitStack
+from pathlib import Path
+import subprocess
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -17,6 +19,28 @@ from auto_round.logger import logger
 from auto_round.modeling.fused_moe.replace_modules import materialize_model_
 from auto_round.utils import convert_module_to_hp_if_necessary, get_block_names
 from auto_round.utils.device_manager import device_manager
+from auto_round.version import __version__
+
+
+def _source_checkout_commit() -> str:
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--short=12", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
+def _describe_provenance_value(value: Any) -> str:
+    if isinstance(value, (str, Path)):
+        return str(value)
+    return type(value).__name__
 
 
 class CalibratedZeroShotCompressor(ZeroShotCompressor):
@@ -37,6 +61,8 @@ class CalibratedZeroShotCompressor(ZeroShotCompressor):
         **kwargs,
     ) -> None:
         configs = config if isinstance(config, list) else [config]
+        self._provenance_model_source = _describe_provenance_value(model)
+        self._provenance_configs = configs
         self._smooth_max_calibration_calls = next(
             (
                 candidate.smooth_max_calibration_calls
@@ -48,6 +74,31 @@ class CalibratedZeroShotCompressor(ZeroShotCompressor):
         kwargs["iters"] = 0
         super().__init__(config=config, model=model, **kwargs)
         self.dataset = dataset
+
+    def _log_svdquant_provenance(self) -> None:
+        if getattr(self, "_svdquant_provenance_logged", False):
+            return
+        config = next((candidate for candidate in self._provenance_configs if hasattr(candidate, "rank")), None)
+        if config is None:
+            return
+        logger.info(
+            "SVDQuant run provenance: model=%s dataset=%s nsamples=%s diffusion_steps=%s "
+            "smooth_max_calibration_calls=%s smooth_num_grids=%s rank=%s residual_iters=%s "
+            "residual_early_stop=%s residual_quant_method=%s autoround_version=%s source_commit=%s",
+            self._provenance_model_source,
+            _describe_provenance_value(self.dataset),
+            getattr(self, "nsamples", "unknown"),
+            getattr(self, "num_inference_steps", "n/a"),
+            getattr(config, "smooth_max_calibration_calls", "n/a"),
+            getattr(config, "smooth_num_grids", "n/a"),
+            getattr(config, "rank", "n/a"),
+            getattr(config, "residual_iters", "n/a"),
+            getattr(config, "residual_early_stop", "n/a"),
+            getattr(config, "residual_quant_method", "n/a"),
+            __version__,
+            _source_checkout_commit(),
+        )
+        self._svdquant_provenance_logged = True
 
     def prepare_calibration_call_selection(self, total_calls: int) -> None:
         """Prepare one deterministic call sample shared by every block group."""
@@ -198,6 +249,7 @@ class CalibratedZeroShotCompressor(ZeroShotCompressor):
 
     @torch.no_grad()
     def quantize(self) -> tuple[torch.nn.Module, dict[str, Any]]:
+        self._log_svdquant_provenance()
         self.post_init()
         self._ensure_calibration_inputs()
         for algorithm in self.pipeline.all():
