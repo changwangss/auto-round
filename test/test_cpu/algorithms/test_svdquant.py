@@ -512,6 +512,7 @@ def test_svdquant_multi_round_ranks_candidates_at_materialized_bf16_dtypes(monke
 
 
 def test_svdquant_early_stop_materializes_best_candidate_when_second_worsens(monkeypatch):
+    import auto_round.algorithms.transforms.svdquant.apply as apply_module
     from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
     from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
 
@@ -537,7 +538,9 @@ def test_svdquant_early_stop_materializes_best_candidate_when_second_worsens(mon
         qdq_calls.append(residual.clone())
         return residual if len(qdq_calls) == 1 else residual + 10.0
 
+    messages = []
     monkeypatch.setattr(residual_module, "rtn_qdq_residual", worsening_second_qdq)
+    monkeypatch.setattr(apply_module.logger, "info", lambda message, *args: messages.append(message % args))
     block = torch.nn.Sequential(layer)
     transform = SVDQuantTransform(
         SVDQuantConfig(rank=1, residual_iters=5, residual_early_stop=True, low_rank_dtype="float32")
@@ -548,6 +551,8 @@ def test_svdquant_early_stop_materializes_best_candidate_when_second_worsens(mon
     u, s, vh = torch.linalg.svd(weight, full_matrices=False)
     expected_low_rank = (u[:, :1] * s[:1].reshape(1, -1)) @ vh[:1]
     assert len(qdq_calls) == 2
+    assert any("model.layers.1.proj" in message and "iteration 2" in message for message in messages)
+    assert any("selected iteration 1" in message for message in messages)
     torch.testing.assert_close(block[0].lora_up.weight @ block[0].lora_down.weight, expected_low_rank)
     torch.testing.assert_close(block[0].residual_linear.weight, weight - expected_low_rank)
 

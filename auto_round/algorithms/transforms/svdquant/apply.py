@@ -184,6 +184,11 @@ class SVDQuantTransform(BaseWeightTransformer):
             self._pre_quantize_smoothed_block(ctx)
             return
 
+        groups = discover_smooth_search_groups(ctx.block, self._is_target)
+        if any(len(group.projections) > 1 for group in groups):
+            self._pre_quantize_data_free_grouped_block(ctx, groups)
+            return
+
         replacements = []
         for name, module in ctx.block.named_modules():
             if self._is_target(name, module):
@@ -191,6 +196,138 @@ class SVDQuantTransform(BaseWeightTransformer):
 
         for name, module in replacements:
             _set_child_module(ctx.block, name, self._decompose_linear(module))
+
+    def _pre_quantize_data_free_grouped_block(self, ctx, groups: list[SmoothSearchGroup]) -> None:
+        local_names = {id(module): name for name, module in ctx.block.named_modules() if name}
+        replacements: list[tuple[str, SVDQuantLinear]] = []
+        for group in groups:
+            scale = torch.ones(
+                group.projections[0].in_features,
+                device=group.projections[0].weight.device,
+                dtype=torch.float32,
+            )
+            wrappers = self._decompose_data_free_group(group, scale)
+            for projection, wrapper in zip(group.projections, wrappers):
+                local_name = local_names.get(id(projection))
+                if local_name is None:
+                    raise ValueError(f"SVDQuant could not locate projection {self._module_name(projection)!r}.")
+                replacements.append((local_name, wrapper))
+
+        for local_name, wrapper in replacements:
+            _set_child_module(ctx.block, local_name, wrapper)
+
+    def _decompose_data_free_group(
+        self,
+        group: SmoothSearchGroup,
+        scale: torch.Tensor,
+    ) -> list[SVDQuantLinear]:
+        weights = [
+            projection.weight.detach().to(torch.float32) * scale.to(projection.weight.device)
+            for projection in group.projections
+        ]
+        stacked = torch.cat(weights, dim=0)
+        output_sizes = [projection.out_features for projection in group.projections]
+        rank = min(self.config.rank, *stacked.shape)
+        low_rank_dtype = self._resolve_low_rank_dtype(group.projections[0].weight.dtype)
+        if self.config.residual_iters == 1:
+            _low_rank, down_weight, stacked_up = _truncated_svd(stacked, rank)
+            deployed_down = down_weight.to(low_rank_dtype)
+            deployed_up = stacked_up.to(low_rank_dtype)
+            deployed_low_rank = deployed_up.float() @ deployed_down.float()
+            residuals = [
+                residual.to(projection.weight.dtype)
+                for residual, projection in zip(
+                    (stacked - deployed_low_rank).split(output_sizes, dim=0),
+                    group.projections,
+                )
+            ]
+        else:
+            residuals, deployed_down, deployed_up = self._iterate_data_free_group_residual(
+                group=group,
+                stacked=stacked,
+                rank=rank,
+                low_rank_dtype=low_rank_dtype,
+            )
+        up_parts = deployed_up.split(output_sizes, dim=0)
+        return self._build_group_wrappers(group, residuals, deployed_down, up_parts, scale)
+
+    def _iterate_data_free_group_residual(
+        self,
+        group: SmoothSearchGroup,
+        stacked: torch.Tensor,
+        rank: int,
+        low_rank_dtype: torch.dtype,
+    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        output_sizes = [projection.out_features for projection in group.projections]
+        quantized_residual = torch.zeros_like(stacked)
+        best: tuple[torch.Tensor, torch.Tensor] | None = None
+        best_error = float("inf")
+        best_iteration = None
+        last_failure = "no finite candidate was produced"
+        for iteration in range(1, self.config.residual_iters + 1):
+            try:
+                _low_rank, down_weight, stacked_up = _truncated_svd(stacked - quantized_residual, rank)
+                deployed_down = down_weight.to(low_rank_dtype)
+                deployed_up = stacked_up.to(low_rank_dtype)
+                deployed_low_rank = deployed_up.float() @ deployed_down.float()
+                residual_parts = (stacked - deployed_low_rank).split(output_sizes, dim=0)
+                qdq_residuals = [
+                    residual_module.rtn_qdq_residual(
+                        residual.to(projection.weight.dtype), self._residual_quant_scheme(projection)
+                    )
+                    for residual, projection in zip(residual_parts, group.projections)
+                ]
+                quantized_residual = torch.cat([residual.float() for residual in qdq_residuals], dim=0)
+                error = torch.sum((stacked - (quantized_residual + deployed_low_rank)).square())
+                error_value = error.item()
+                del qdq_residuals, error
+            except (RuntimeError, ValueError, TypeError) as exc:
+                last_failure = f"iteration {iteration}: {exc}"
+                break
+
+            accepted = math.isfinite(error_value) and error_value <= best_error
+            if accepted:
+                best = (deployed_down.clone(), deployed_up.clone())
+                best_error = error_value
+                best_iteration = iteration
+            elif not math.isfinite(error_value):
+                last_failure = f"iteration {iteration}: weight error is non-finite"
+
+            if iteration % 10 == 0 or iteration == self.config.residual_iters:
+                logger.info(
+                    "SVDQuant residual progress for %s: iteration %d/%d weight error %.6g best %.6g",
+                    group.key,
+                    iteration,
+                    self.config.residual_iters,
+                    error_value,
+                    best_error,
+                )
+            if self.config.residual_early_stop and best is not None and not accepted:
+                logger.info(
+                    "SVDQuant residual early stop for %s at iteration %d: weight error %.6g > best %.6g",
+                    group.key,
+                    iteration,
+                    error_value,
+                    best_error,
+                )
+                break
+
+        if best is None or best_iteration is None:
+            raise ValueError(f"SVDQuant residual iteration failed for group {group.key!r}: {last_failure}.")
+        logger.info(
+            "SVDQuant residual selected iteration %d/%d for %s: weight error %.6g",
+            best_iteration,
+            self.config.residual_iters,
+            group.key,
+            best_error,
+        )
+        deployed_down, deployed_up = best
+        deployed_low_rank = deployed_up.float() @ deployed_down.float()
+        residuals = [
+            residual.to(projection.weight.dtype)
+            for residual, projection in zip((stacked - deployed_low_rank).split(output_sizes, dim=0), group.projections)
+        ]
+        return residuals, deployed_down, deployed_up
 
     def _pre_quantize_smoothed_block(self, ctx) -> None:
         if not self._smooth_calibration:
@@ -630,24 +767,45 @@ class SVDQuantTransform(BaseWeightTransformer):
             deployed_low_rank = deployed_up.float() @ deployed_down.float()
             error = torch.sum((weight_hat - (quantized_residual + deployed_low_rank)).square())
             error_value = error.item()
-            improved = False
-            if math.isfinite(error_value):
-                if error_value < best_error:
-                    best_down = down_weight.clone()
-                    best_up = up_weight.clone()
-                    best_error = error_value
-                    best_iteration = iteration
-                    improved = True
-            else:
+            accepted = math.isfinite(error_value) and error_value <= best_error
+            if accepted:
+                best_down = down_weight.clone()
+                best_up = up_weight.clone()
+                best_error = error_value
+                best_iteration = iteration
+            elif not math.isfinite(error_value):
                 last_failure = (iteration, "reconstruction error is non-finite")
 
             del deployed_down, deployed_up, deployed_low_rank, down_weight, up_weight, error
 
-            if self.config.residual_early_stop and best_down is not None and not improved:
+            if iteration % 10 == 0 or iteration == self.config.residual_iters:
+                logger.info(
+                    "SVDQuant residual progress for %s: iteration %d/%d weight error %.6g best %.6g",
+                    self._module_name(module),
+                    iteration,
+                    self.config.residual_iters,
+                    error_value,
+                    best_error,
+                )
+            if self.config.residual_early_stop and best_down is not None and not accepted:
+                logger.info(
+                    "SVDQuant residual early stop for %s at iteration %d: weight error %.6g > best %.6g",
+                    self._module_name(module),
+                    iteration,
+                    error_value,
+                    best_error,
+                )
                 break
 
         if best_down is not None and best_up is not None:
             assert best_iteration is not None
+            logger.info(
+                "SVDQuant residual selected iteration %d/%d for %s: weight error %.6g",
+                best_iteration,
+                self.config.residual_iters,
+                self._module_name(module),
+                best_error,
+            )
             residual_weight = weight_hat - best_up @ best_down
             self._raise_if_nonfinite(module, best_iteration, residual_weight, best_down, best_up)
             return residual_weight, best_down, best_up

@@ -74,6 +74,8 @@ class ZeroShotCompressor(BaseCompressor):
 
     def _create_block_context(self, block: torch.nn.Module, block_name: str) -> BlockContext:
         """Create the data-free context used by the terminal block quantizer."""
+        convert_module_to_hp_if_necessary(block, self.model_context.amp_dtype, device_manager.device)
+        block.to(device_manager.device)
         return BlockContext(
             model=self.model_context.model,
             block=block,

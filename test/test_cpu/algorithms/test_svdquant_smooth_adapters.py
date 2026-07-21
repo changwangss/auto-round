@@ -310,6 +310,142 @@ def test_flux_qkv_search_uses_parent_output_and_final_shared_down(monkeypatch):
     torch.testing.assert_close(actual_output, reference_output, rtol=0, atol=1e-5)
 
 
+def test_flux_no_smooth_qkv_uses_identity_scale_and_shared_down():
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+    from auto_round.algorithms.transforms.svdquant.wrapper import SVDQuantLinear
+
+    block = FluxTransformerBlock(width=4)
+    block.global_name = "transformer_blocks.0"
+    for name, projection in (("to_q", block.attn.to_q), ("to_k", block.attn.to_k), ("to_v", block.attn.to_v)):
+        projection.data_type = "int"
+        projection.bits = 4
+        projection.group_size = 2
+        projection.sym = True
+        projection.global_name = f"transformer_blocks.0.attn.{name}"
+
+    transform = SVDQuantTransform(
+        SVDQuantConfig(
+            rank=2,
+            smooth_enabled=False,
+            residual_iters=1,
+            low_rank_dtype="float32",
+            target_modules=["attn.to_q", "attn.to_k", "attn.to_v"],
+        )
+    )
+
+    transform.pre_quantize_block(type("Context", (), {"block": block})())
+
+    wrappers = (block.attn.to_q, block.attn.to_k, block.attn.to_v)
+    assert all(isinstance(wrapper, SVDQuantLinear) for wrapper in wrappers)
+    assert all(wrapper.activation_qdq is None for wrapper in wrappers)
+    for wrapper in wrappers:
+        torch.testing.assert_close(wrapper.smooth, torch.ones(4), rtol=0, atol=0)
+        torch.testing.assert_close(wrapper.lora_down.weight, wrappers[0].lora_down.weight, rtol=0, atol=0)
+
+
+def test_flux_no_smooth_grouped_residual_logs_early_stop(monkeypatch):
+    import auto_round.algorithms.transforms.svdquant.apply as apply_module
+    import auto_round.algorithms.transforms.svdquant.residual as residual_module
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    block = FluxTransformerBlock(width=2)
+    block.global_name = "transformer_blocks.0"
+    projections = (block.attn.to_q, block.attn.to_k, block.attn.to_v)
+    for name, projection in zip(("to_q", "to_k", "to_v"), projections):
+        projection.data_type = "int"
+        projection.bits = 4
+        projection.group_size = 2
+        projection.sym = True
+        projection.global_name = f"transformer_blocks.0.attn.{name}"
+
+    svd_calls = []
+
+    def fake_svd(weight, rank):
+        iteration = len(svd_calls) + 1
+        svd_calls.append(iteration)
+        down = torch.full((rank, weight.shape[1]), float(iteration), device=weight.device)
+        up = torch.zeros((weight.shape[0], rank), device=weight.device)
+        return torch.zeros_like(weight), down, up
+
+    qdq_calls = []
+
+    def worsening_second_qdq(residual, _scheme):
+        iteration = len(qdq_calls) // len(projections) + 1
+        qdq_calls.append(iteration)
+        return residual if iteration == 1 else residual + 10
+
+    messages = []
+    monkeypatch.setattr(apply_module, "_truncated_svd", fake_svd)
+    monkeypatch.setattr(residual_module, "rtn_qdq_residual", worsening_second_qdq)
+    monkeypatch.setattr(apply_module.logger, "info", lambda message, *args: messages.append(message % args))
+    transform = SVDQuantTransform(
+        SVDQuantConfig(
+            rank=1,
+            smooth_enabled=False,
+            residual_iters=100,
+            residual_early_stop=True,
+            low_rank_dtype="float32",
+            target_modules=["attn.to_q", "attn.to_k", "attn.to_v"],
+        )
+    )
+
+    transform.pre_quantize_block(type("Context", (), {"block": block})())
+
+    assert svd_calls == [1, 2]
+    assert qdq_calls == [1, 1, 1, 2, 2, 2]
+    assert any("transformer_blocks.0.attn.qkv" in message and "iteration 2" in message for message in messages)
+    assert any("selected iteration 1" in message for message in messages)
+
+
+def test_flux_no_smooth_grouped_residual_logs_tenth_iteration(monkeypatch):
+    import auto_round.algorithms.transforms.svdquant.apply as apply_module
+    import auto_round.algorithms.transforms.svdquant.residual as residual_module
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    block = FluxTransformerBlock(width=2)
+    block.global_name = "transformer_blocks.0"
+    projections = (block.attn.to_q, block.attn.to_k, block.attn.to_v)
+    for name, projection in zip(("to_q", "to_k", "to_v"), projections):
+        projection.data_type = "int"
+        projection.bits = 4
+        projection.group_size = 2
+        projection.sym = True
+        projection.global_name = f"transformer_blocks.0.attn.{name}"
+
+    svd_calls = []
+
+    def fake_svd(weight, rank):
+        iteration = len(svd_calls) + 1
+        svd_calls.append(iteration)
+        down = torch.full((rank, weight.shape[1]), float(iteration), device=weight.device)
+        up = torch.zeros((weight.shape[0], rank), device=weight.device)
+        return torch.zeros_like(weight), down, up
+
+    messages = []
+    monkeypatch.setattr(apply_module, "_truncated_svd", fake_svd)
+    monkeypatch.setattr(residual_module, "rtn_qdq_residual", lambda residual, _scheme: residual)
+    monkeypatch.setattr(apply_module.logger, "info", lambda message, *args: messages.append(message % args))
+    transform = SVDQuantTransform(
+        SVDQuantConfig(
+            rank=1,
+            smooth_enabled=False,
+            residual_iters=10,
+            residual_early_stop=False,
+            low_rank_dtype="float32",
+            target_modules=["attn.to_q", "attn.to_k", "attn.to_v"],
+        )
+    )
+
+    transform.pre_quantize_block(type("Context", (), {"block": block})())
+
+    assert svd_calls == list(range(1, 11))
+    assert any("iteration 10/10" in message for message in messages)
+    assert any("selected iteration 10" in message for message in messages)
+
+
 def test_flux_smooth_search_restores_bfloat16_evaluation_dtype(monkeypatch):
     import auto_round.algorithms.transforms.svdquant.residual as residual_module
     from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform

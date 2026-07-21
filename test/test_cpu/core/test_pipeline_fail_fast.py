@@ -22,6 +22,7 @@ from auto_round.compressors.data_driven import DataDrivenCompressor
 from auto_round.compressors.diffusion_mixin import DiffusionMixin
 from auto_round.compressors.entry import AutoRound as NewAutoRound
 from auto_round.compressors.entry import _select_rtn_compressor_base_cls
+import auto_round.compressors.zero_shot as zero_shot_module
 from auto_round.compressors.zero_shot import ZeroShotCompressor
 from auto_round.logger import logger
 from auto_round.schemes import QuantizationScheme
@@ -257,6 +258,40 @@ def test_data_free_svdquant_rtn_routes_to_zero_shot(monkeypatch):
 
     assert isinstance(result, ZeroShotCompressor)
     assert captured["config"][0].requires_calibration is False
+
+
+def test_zero_shot_block_context_moves_current_block_to_quantization_device(monkeypatch):
+    calls = []
+
+    class Block:
+        def to(self, device):
+            calls.append(("move", device))
+            return self
+
+    block = Block()
+    compressor = ZeroShotCompressor.__new__(ZeroShotCompressor)
+    compressor.model_context = SimpleNamespace(
+        model=object(),
+        amp_dtype=torch.bfloat16,
+        is_mllm=False,
+        is_diffusion=True,
+    )
+    compressor.quantizer = SimpleNamespace(create_block_io=lambda *args: object())
+    monkeypatch.setattr(zero_shot_module.device_manager, "device", torch.device("cuda:0"))
+    monkeypatch.setattr(
+        zero_shot_module,
+        "convert_module_to_hp_if_necessary",
+        lambda current, dtype, device: calls.append(("convert", current, dtype, device)),
+    )
+
+    context = compressor._create_block_context(block, "transformer_blocks.0")
+
+    assert calls == [
+        ("convert", block, torch.bfloat16, "cuda:0"),
+        ("move", "cuda:0"),
+    ]
+    assert context.block is block
+    assert context.device == "cuda:0"
 
 
 def test_calibrated_svdquant_rtn_routes_to_calibrated_zero_shot(monkeypatch):
