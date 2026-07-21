@@ -66,11 +66,13 @@ def build_smooth_scale(
 
     x_span = x_span.to(torch.float32)
     w_span = w_span.to(device=x_span.device, dtype=torch.float32)
+    x_zero = x_span == 0
+    w_zero = w_span == 0
     if eps is not None:
         if eps <= 0:
             raise ValueError(f"`eps` must be positive, got {eps!r}")
-        x_span = x_span.clamp_min(eps)
-        w_span = w_span.clamp_min(eps)
+        x_span = torch.where(x_zero, eps, x_span)
+        w_span = torch.where(w_zero, eps, w_span)
     if alpha == 0.0 and beta == 0.0:
         return torch.ones_like(x_span)
 
@@ -82,6 +84,10 @@ def build_smooth_scale(
         scale = w_span.pow(-beta)
 
     scale = scale.clone()
+    if beta > 0.0 and bool(w_zero.any()):
+        scale.fill_(1)
+    elif alpha > 0.0:
+        scale[x_zero] = 1
     scale[scale == 0] = 1
     if not torch.isfinite(scale).all():
         scale.fill_(1)

@@ -89,7 +89,7 @@ def test_build_smooth_scale_falls_back_entire_scale_on_nonfinite_value():
     torch.testing.assert_close(scale, torch.ones(2))
 
 
-def test_build_smooth_scale_clamps_span_bases_with_epsilon():
+def test_build_smooth_scale_uses_identity_if_both_span_bases_are_zero_with_epsilon():
     from auto_round.algorithms.transforms.svdquant.smooth import build_smooth_scale
 
     scale = build_smooth_scale(
@@ -100,7 +100,35 @@ def test_build_smooth_scale_clamps_span_bases_with_epsilon():
         eps=1e-4,
     )
 
-    torch.testing.assert_close(scale, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(scale, torch.ones(2))
+
+
+def test_build_smooth_scale_keeps_zero_activation_channels_at_identity_with_epsilon():
+    from auto_round.algorithms.transforms.svdquant.smooth import build_smooth_scale
+
+    scale = build_smooth_scale(
+        torch.tensor([0.0, 4.0]),
+        torch.ones(2),
+        alpha=0.6,
+        beta=0.0,
+        eps=1e-6,
+    )
+
+    torch.testing.assert_close(scale, torch.tensor([1.0, 4.0**0.6]))
+
+
+def test_build_smooth_scale_uses_identity_if_weight_denominator_is_zero_with_epsilon():
+    from auto_round.algorithms.transforms.svdquant.smooth import build_smooth_scale
+
+    scale = build_smooth_scale(
+        torch.tensor([4.0, 9.0]),
+        torch.tensor([0.0, 1.0]),
+        alpha=0.5,
+        beta=0.5,
+        eps=1e-6,
+    )
+
+    torch.testing.assert_close(scale, torch.ones(2))
 
 
 def test_validate_smooth_scale_for_deployment_rejects_nonfinite_reciprocal():
