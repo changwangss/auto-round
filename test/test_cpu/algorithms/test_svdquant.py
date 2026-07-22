@@ -105,6 +105,60 @@ def test_svdquant_config_is_pipeline_preprocessor():
     assert pipeline.block_quantizer.__class__.__name__ in {"RTNQuantizer", "OptimizedRTNQuantizer"}
 
 
+def test_svdquant_mxfp4_residual_keeps_rceil_semantics_through_rtn_and_nunchaku_pack():
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+    from auto_round.data_type.mxfp import quant_mx, quant_mx_rceil
+    from auto_round.export.svdquant_mxfp4 import NunchakuMXFP4Packer
+    from auto_round.wrapper import WrapperLinear
+
+    torch.manual_seed(0)
+    layer = torch.nn.Linear(64, 8, bias=False)
+    layer.weight.data.mul_(3.7)
+    layer.data_type = "mx_fp"
+    layer.bits = 4
+    layer.group_size = 32
+    layer.sym = True
+    layer.act_data_type = "mx_fp"
+    layer.act_bits = 4
+    layer.act_group_size = 32
+    layer.act_sym = True
+    layer.act_dynamic = True
+    layer.scale_dtype = torch.float32
+    layer.global_name = "model.layers.0.proj"
+    block = torch.nn.Sequential(layer)
+    transform = SVDQuantTransform(SVDQuantConfig(rank=2, residual_iters=1, low_rank_dtype="float32"))
+
+    transform.pre_quantize_block(types.SimpleNamespace(block=block, block_name="model.layers.0"))
+
+    residual = block[0].residual_linear
+    original_residual = residual.weight.detach().clone()
+    expected, _, _ = quant_mx_rceil(original_residual, bits=4, group_size=32, data_type="mx_fp4e2m1")
+    floor_qdq, _, _ = quant_mx(original_residual, bits=4, group_size=32, data_type="mx_fp")
+    assert torch.count_nonzero(expected != floor_qdq) > 0
+
+    block[0].residual_linear = WrapperLinear(
+        residual,
+        enable_minmax_tuning=False,
+        enable_norm_bias_tuning=False,
+        enable_round_tuning=False,
+        disable_opt_rtn=True,
+        iters=0,
+    ).unwrapper({})
+    terminal_residual = block[0].residual_linear.weight.detach()
+    torch.testing.assert_close(terminal_residual, expected)
+
+    packer = NunchakuMXFP4Packer()
+    packed = packer.pack_residual(terminal_residual)
+    unpacked = packer.unpack_residual(
+        packed.qweight,
+        packed.wscales,
+        packed.logical_shape,
+        dtype=terminal_residual.dtype,
+    )
+    torch.testing.assert_close(unpacked, expected)
+
+
 def test_svdquant_linear_matches_manual_reference():
     from auto_round.algorithms.transforms.svdquant.wrapper import SVDQuantLinear
 
@@ -508,6 +562,29 @@ def test_svdquant_multi_round_ranks_candidates_at_materialized_bf16_dtypes(monke
     )
     torch.testing.assert_close(block[0].lora_down.weight, expected_down, rtol=0, atol=0)
     torch.testing.assert_close(block[0].lora_up.weight, expected_up, rtol=0, atol=0)
+    torch.testing.assert_close(block[0].residual_linear.weight, expected_residual, rtol=0, atol=0)
+
+
+def test_svdquant_non_grouped_residual_is_materialized_against_deployed_low_rank_factors(monkeypatch):
+    from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    torch.manual_seed(31)
+    layer = torch.nn.Linear(16, 12, bias=False, dtype=torch.bfloat16)
+    layer.data_type = "int"
+    layer.bits = 4
+    layer.group_size = 4
+    layer.sym = True
+    layer.global_name = "model.layers.0.proj"
+    original_weight = layer.weight.detach().float()
+    monkeypatch.setattr(residual_module, "rtn_qdq_residual", lambda residual, scheme: residual)
+    block = torch.nn.Sequential(layer)
+    transform = SVDQuantTransform(SVDQuantConfig(rank=3, residual_iters=2, low_rank_dtype="bfloat16"))
+
+    transform.pre_quantize_block(types.SimpleNamespace(block=block, block_name="model.layers.0"))
+
+    deployed_low_rank = block[0].lora_up.weight.float() @ block[0].lora_down.weight.float()
+    expected_residual = (original_weight - deployed_low_rank).to(torch.bfloat16)
     torch.testing.assert_close(block[0].residual_linear.weight, expected_residual, rtol=0, atol=0)
 
 

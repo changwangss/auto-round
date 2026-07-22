@@ -59,6 +59,7 @@ _SCHEME_ATTRS = (
     "weight_global_scale",
     "tuning_device",
 )
+_MXFP4_ALIASES = frozenset({"mx_fp", "mx_fp4", "mx_fp4e2m1"})
 
 
 @dataclass
@@ -769,8 +770,8 @@ class SVDQuantTransform(BaseWeightTransformer):
             error_value = error.item()
             accepted = math.isfinite(error_value) and error_value <= best_error
             if accepted:
-                best_down = down_weight.clone()
-                best_up = up_weight.clone()
+                best_down = deployed_down.clone()
+                best_up = deployed_up.clone()
                 best_error = error_value
                 best_iteration = iteration
             elif not math.isfinite(error_value):
@@ -806,7 +807,7 @@ class SVDQuantTransform(BaseWeightTransformer):
                 self._module_name(module),
                 best_error,
             )
-            residual_weight = weight_hat - best_up @ best_down
+            residual_weight = weight_hat - best_up.float() @ best_down.float()
             self._raise_if_nonfinite(module, best_iteration, residual_weight, best_down, best_up)
             return residual_weight, best_down, best_up
 
@@ -892,6 +893,10 @@ class SVDQuantTransform(BaseWeightTransformer):
         for attr in _SCHEME_ATTRS:
             if hasattr(src, attr):
                 setattr(dst, attr, getattr(src, attr))
+        if getattr(dst, "bits", None) == 4 and getattr(dst, "data_type", None) in _MXFP4_ALIASES:
+            dst.data_type = f"{dst.data_type}_rceil"
+        if getattr(dst, "act_bits", None) == 4 and getattr(dst, "act_data_type", None) in _MXFP4_ALIASES:
+            dst.act_data_type = f"{dst.act_data_type}_rceil"
         if hasattr(src, "global_name"):
             dst.global_name = f"{src.global_name}{suffix}"
 

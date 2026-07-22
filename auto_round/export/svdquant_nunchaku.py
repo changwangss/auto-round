@@ -285,7 +285,8 @@ def _validate_selected_scheme(scheme: SVDQuantLinearScheme, prefix: str) -> tupl
     missing_weight = [name for name, value in required_weight.items() if value is None]
     if missing_weight:
         raise ValueError(f"{prefix} selected residual scheme is missing required {missing_weight[0]}")
-    if not isinstance(scheme.data_type, str) or scheme.data_type not in _DEPLOYABLE_E2M1_ALIASES:
+    weight_data_type = scheme.data_type.removesuffix("_rceil") if isinstance(scheme.data_type, str) else None
+    if weight_data_type not in _DEPLOYABLE_E2M1_ALIASES:
         raise ValueError(
             f"{prefix} residual data_type must be one of {sorted(_DEPLOYABLE_E2M1_ALIASES)}, got {scheme.data_type!r}"
         )
@@ -306,7 +307,10 @@ def _validate_selected_scheme(scheme: SVDQuantLinearScheme, prefix: str) -> tupl
     missing_activation = [name for name, value in required_activation.items() if value is None]
     if missing_activation:
         raise ValueError(f"{prefix} selected scheme is missing required activation value {missing_activation[0]}")
-    if not isinstance(scheme.act_data_type, str) or scheme.act_data_type not in _DEPLOYABLE_E2M1_ALIASES:
+    activation_data_type = (
+        scheme.act_data_type.removesuffix("_rceil") if isinstance(scheme.act_data_type, str) else None
+    )
+    if activation_data_type not in _DEPLOYABLE_E2M1_ALIASES:
         raise ValueError(
             f"{prefix} activation data_type must be one of {sorted(_DEPLOYABLE_E2M1_ALIASES)}, "
             f"got {scheme.act_data_type!r}"

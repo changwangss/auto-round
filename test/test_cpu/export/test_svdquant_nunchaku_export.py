@@ -270,6 +270,16 @@ def test_collection_accepts_normal_autoround_mxfp4_preset_values():
     assert "0.qweight" in tensors
 
 
+def test_collection_accepts_svdquant_rceil_deployment_types():
+    model = _toy_model()
+    model[0].residual_linear.data_type = "mx_fp4e2m1_rceil"
+    model[0].residual_linear.act_data_type = "mx_fp4e2m1_rceil"
+
+    tensors = collect_svdquant_tensors(model)
+
+    assert "0.qweight" in tensors
+
+
 def test_collection_rejects_nonfinite_values_and_mixed_ranks():
     nonfinite = _toy_model()
     nonfinite[0].smooth[0] = torch.nan
