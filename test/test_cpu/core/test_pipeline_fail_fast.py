@@ -77,6 +77,7 @@ def test_diffusion_reference_inputs_preserve_flux_dual_streams():
 
     class Quantizer:
         batch_size = 1
+        enable_quanted_input = True
         model_context = SimpleNamespace(amp=False, amp_dtype=torch.float32)
         compress_context = SimpleNamespace(cache_device="cpu", clear_memory=lambda: None)
 
@@ -104,6 +105,17 @@ def test_diffusion_reference_inputs_preserve_flux_dual_streams():
 
     torch.testing.assert_close(outputs["encoder_hidden_states"][0], torch.tensor([[11.0]]))
     torch.testing.assert_close(outputs["hidden_states"][0], torch.tensor([[22.0]]))
+    torch.testing.assert_close(io.get_reference_outputs(torch.tensor([0])), torch.tensor([[11.0, 22.0]]))
+
+    predicted = io.forward_block_batch(torch.tensor([0]), device="cpu")
+
+    torch.testing.assert_close(predicted, torch.tensor([[11.0, 22.0]]))
+
+    next_inputs = io.collect_next_inputs()
+
+    assert set(next_inputs) == {"encoder_hidden_states", "hidden_states"}
+    torch.testing.assert_close(next_inputs["encoder_hidden_states"][0], torch.tensor([[11.0]]))
+    torch.testing.assert_close(next_inputs["hidden_states"][0], torch.tensor([[22.0]]))
 
 
 def test_pipeline_duplicate_preprocessor_rejected():

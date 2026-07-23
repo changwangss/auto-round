@@ -138,6 +138,24 @@ def _save_diffusion_component_config(component, output_dir: str | os.PathLike) -
             handle.write("\n")
 
 
+def _link_local_unquantized_component(pipe, name: str, output_dir: str | os.PathLike) -> bool:
+    """Link one local BF16 pipeline component when explicitly requested."""
+
+    if os.environ.get("AUTOROUND_LINK_UNQUANTIZED_PIPELINE_COMPONENTS") != "1":
+        return False
+    config = getattr(pipe, "config", {})
+    source_root = config.get("_name_or_path") if hasattr(config, "get") else None
+    source_path = Path(source_root, name) if isinstance(source_root, str) and source_root else None
+    if source_path is None or not source_path.is_dir():
+        raise ValueError(f"Cannot link pipeline component {name!r}: local source directory is unavailable")
+    output_path = Path(output_dir)
+    if output_path.exists() or output_path.is_symlink():
+        raise FileExistsError(f"Cannot link pipeline component {name!r}: output already exists at {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.symlink_to(os.path.relpath(source_path, output_path.parent), target_is_directory=True)
+    return True
+
+
 class DiffusionMixin:
     """Diffusion-specific functionality mixin.
 
@@ -755,7 +773,8 @@ class DiffusionMixin:
                 saved_quantized_component = True
                 saved_component = self.model_context.model
             elif val is not None and hasattr(val, "save_pretrained"):
-                val.save_pretrained(sub_module_path)
+                if not (nunchaku_pipeline_export and _link_local_unquantized_component(pipe, name, sub_module_path)):
+                    val.save_pretrained(sub_module_path)
                 folders.append(sub_module_path)
                 continue
             else:

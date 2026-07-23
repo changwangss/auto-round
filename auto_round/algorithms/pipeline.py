@@ -445,12 +445,11 @@ class DiffusionBlockIO(BlockIO):
         return len(input_ids["hidden_states"]) if isinstance(input_ids, dict) else len(input_ids)
 
     @torch.no_grad()
-    def collect_reference_inputs(self, hooks=None) -> dict[str, list[torch.Tensor]]:
-        """Preserve every configured diffusion output stream for block propagation."""
-        _ = hooks
-        input_ids = self._inputs_for(InputSource.FP_CACHE)
+    def _collect_stream_outputs(self, source: InputSource) -> dict[str, list[torch.Tensor]]:
+        """Collect every configured diffusion stream for the next block."""
+        input_ids = self._inputs_for(source)
         if input_ids is None:
-            raise ValueError("FP calibration inputs are unavailable for this diffusion block.")
+            raise ValueError(f"Input source {source.name} is unavailable for this diffusion block.")
         outputs = {name: [] for name in self.output_config}
         for start, end in self._iter_batch_ranges(input_ids, self._quantizer.batch_size):
             indices = torch.arange(start, end).to(torch.long)
@@ -472,8 +471,37 @@ class DiffusionBlockIO(BlockIO):
                     outputs[name].append(output)
                 else:
                     outputs[name].extend(list(torch.split(output, 1, dim=self.batch_dim)))
-        self._reference_outputs = outputs["hidden_states"]
         self._quantizer.compress_context.clear_memory()
+        return outputs
+
+    @torch.no_grad()
+    def collect_reference_inputs(self, hooks=None) -> dict[str, list[torch.Tensor]]:
+        """Preserve every configured FP diffusion output stream for block propagation."""
+        _ = hooks
+        outputs = self._collect_stream_outputs(InputSource.FP_CACHE)
+        self._reference_outputs = outputs
+        return outputs
+
+    def get_reference_outputs(self, indices: torch.Tensor, *, device=None) -> torch.Tensor:
+        """Materialize the configured diffusion streams as one batch loss tensor."""
+        if not isinstance(self._reference_outputs, dict):
+            return super().get_reference_outputs(indices, device=device)
+        streams = []
+        for name in self.output_config:
+            outputs = self._reference_outputs.get(name)
+            if outputs is None:
+                raise ValueError(f"Reference outputs do not contain diffusion stream {name!r}.")
+            streams.append(torch.cat([outputs[i] for i in indices], dim=self.batch_dim))
+        output = self._normalize_output_for_loss(tuple(streams))
+        return output.to(device) if device is not None else output
+
+    @torch.no_grad()
+    def collect_next_inputs(self) -> dict[str, list[torch.Tensor]] | None:
+        """Preserve every configured quantized diffusion stream for block propagation."""
+        if self._quantizer is None or not self._quantizer.enable_quanted_input:
+            return None
+        outputs = self._collect_stream_outputs(self._active_source)
+        self._quantized_outputs = outputs
         return outputs
 
     def _normalize_output_for_loss(self, output: Any) -> torch.Tensor:
@@ -484,19 +512,22 @@ class DiffusionBlockIO(BlockIO):
                 "DiffusionBlockIO forward must return a tensor or tuple/list of tensors. "
                 f"Got {type(output).__name__}."
             )
-        if "hidden_states" not in self.output_config:
+        if len(output) != len(self.output_config):
             raise ValueError(
-                "DiffusionBlockIO requires 'hidden_states' in output_config to normalize outputs for loss."
+                f"Diffusion block returned {len(output)} tensors for loss, expected {len(self.output_config)}."
             )
-        hidden_state_index = self.output_config.index("hidden_states")
-        if hidden_state_index >= len(output):
-            raise ValueError(
-                f"Diffusion block output has {len(output)} tensors, but hidden_states index is {hidden_state_index}."
-            )
-        hidden_states = output[hidden_state_index]
-        if not isinstance(hidden_states, torch.Tensor):
-            raise TypeError("DiffusionBlockIO expected hidden_states to be a tensor after output normalization.")
-        return hidden_states
+        if len(output) == 1:
+            if not isinstance(output[0], torch.Tensor):
+                raise TypeError("DiffusionBlockIO expected a tensor after output normalization.")
+            return output[0]
+
+        flattened = []
+        for name, stream in zip(self.output_config, output):
+            if not isinstance(stream, torch.Tensor):
+                raise TypeError(f"DiffusionBlockIO expected stream {name!r} to be a tensor.")
+            batch_dim = self.batch_dim % stream.ndim
+            flattened.append(stream.movedim(batch_dim, 0).reshape(stream.shape[batch_dim], -1))
+        return torch.cat(flattened, dim=1)
 
 
 @dataclass

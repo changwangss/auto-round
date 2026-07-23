@@ -114,6 +114,24 @@ def test_nunchaku_pipeline_index_requires_model_class_metadata(tmp_path):
         _rewrite_nunchaku_pipeline_index(tmp_path, ["transformer"])
 
 
+def test_local_unquantized_component_link_is_explicit_and_relative(monkeypatch, tmp_path):
+    from auto_round.compressors.diffusion_mixin import _link_local_unquantized_component
+
+    source_root = tmp_path / "source"
+    source_component = source_root / "vae"
+    source_component.mkdir(parents=True)
+    pipe = SimpleNamespace(config={"_name_or_path": str(source_root)})
+    output_component = tmp_path / "output" / "vae"
+
+    assert _link_local_unquantized_component(pipe, "vae", output_component) is False
+
+    monkeypatch.setenv("AUTOROUND_LINK_UNQUANTIZED_PIPELINE_COMPONENTS", "1")
+
+    assert _link_local_unquantized_component(pipe, "vae", output_component) is True
+    assert output_component.is_symlink()
+    assert output_component.resolve() == source_component.resolve()
+
+
 def test_diffusion_save_exports_self_contained_nunchaku_pipeline(tmp_path):
     from auto_round.compressors.diffusion_mixin import DiffusionMixin
 
