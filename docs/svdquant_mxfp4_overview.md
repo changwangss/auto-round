@@ -116,8 +116,13 @@ only a deterministic uniform subset of at most `K` calls is copied to CPU.
 
 - `K` is controlled by `--svdquant_smooth_max_calibration_calls`.
 - Non-selected calls are not copied and are released after forward.
+- With terminal SignRound, the selected calls are the shared pool for smooth
+  search, residual output-error scoring, and SignRound optimization.
+- No-smooth SignRound keeps its original calibration behavior.
 - FLUX caches only the double-stream and single-stream entry blocks.
-- BF16 reference outputs propagate to the next block; quantized outputs do not.
+- BF16 reference outputs propagate to the next block in both paths. Terminal
+  RTN does not propagate quantized outputs; terminal SignRound propagates the
+  selected pool's quantized outputs.
 - Both `encoder_hidden_states` and `hidden_states` are preserved.
 - Current-block buffers are released before processing the next block.
 

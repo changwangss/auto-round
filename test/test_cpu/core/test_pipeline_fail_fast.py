@@ -402,6 +402,36 @@ def test_calibrated_zero_shot_resets_call_counters_for_new_collection():
     assert second == first
 
 
+def test_data_driven_smooth_svdquant_bounds_shared_signround_calibration_pool():
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+    compressor._configure_svdquant_smooth_call_selection(
+        [SVDQuantConfig(smooth_enabled=True, smooth_max_calibration_calls=3), SignRoundConfig(iters=8)]
+    )
+    compressor.prepare_calibration_call_selection(total_calls=10)
+
+    first_group = [index for index in range(10) if compressor.should_cache_calibration_call("blocks.0")]
+    second_group = [index for index in range(10) if compressor.should_cache_calibration_call("single_blocks.0")]
+
+    assert first_group == [0, 4, 9]
+    assert second_group == first_group
+
+
+def test_data_driven_no_smooth_signround_keeps_every_calibration_call():
+    from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
+
+    compressor = DataDrivenCompressor.__new__(DataDrivenCompressor)
+    compressor._configure_svdquant_smooth_call_selection(
+        [SVDQuantConfig(smooth_enabled=False, smooth_max_calibration_calls=3), SignRoundConfig(iters=8)]
+    )
+    compressor.prepare_calibration_call_selection(total_calls=10)
+
+    retained = [index for index in range(10) if compressor.should_cache_calibration_call("blocks.0")]
+
+    assert retained == list(range(10))
+
+
 def test_calibrated_zero_shot_logs_svdquant_provenance_once(monkeypatch):
     from auto_round.algorithms.transforms.svdquant.config import SVDQuantConfig
 

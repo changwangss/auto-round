@@ -117,9 +117,13 @@ Q_t = MXFP4_QDQ(R_t)
 
 - `K` 由 `--svdquant_smooth_max_calibration_calls` 控制。
 - 未选中的 calls 不复制到 CPU，forward 后自然释放。
+- 最终量化器为 SignRound 时，选中的 calls 由 smooth 搜索、residual
+  output-error 评分和 SignRound 优化共同使用。
+- No-smooth SignRound 保持原有 calibration 行为。
 - FLUX 只缓存 double-stream 和 single-stream 两个入口 block。
-- 当前 block 的 BF16 reference output 传播给下一个 block。
-- Quantized block output 不参与后续 calibration 传播。
+- 两条路径都会把当前 block 的 BF16 reference output 传播给下一个 block。
+- 最终 RTN 不传播 quantized output；最终 SignRound 会传播选中 calibration
+  pool 对应的 quantized output。
 - Double-stream 同时保留 `encoder_hidden_states` 和 `hidden_states`。
 - 当前 block 完成后立即释放其临时 smooth 数据。
 

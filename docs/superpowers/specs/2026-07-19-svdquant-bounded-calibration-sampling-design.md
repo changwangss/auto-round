@@ -88,14 +88,16 @@ Both entries use the same selected call indices.
 
 ### Blockwise propagation
 
-Only the selected `K` states enter `CalibratedZeroShotCompressor`. Full-precision
+Only the selected `K` states enter the blockwise compressor. Full-precision
 outputs from the current block become the selected inputs for the next block.
 The existing dual-stream FLUX contract remains intact: both
 `encoder_hidden_states` and `hidden_states` propagate between double-stream
 blocks.
 
-Terminal residual quantization remains zero-shot RTN. Quantized block outputs
-are not propagated as calibration inputs.
+For terminal RTN, quantized block outputs are not propagated as calibration
+inputs. For terminal SignRound, the selected states form the shared
+calibration pool used by smooth search, residual output-error scoring, and
+SignRound optimization; SignRound continues to propagate quantized outputs.
 
 ### Smooth collection and scoring
 
@@ -137,19 +139,22 @@ memory measurement establishes a higher safe value.
 
 ## Integration Boundaries
 
-The sampling policy belongs to the calibrated zero-shot SVDQuant path. It must
-not change:
+The sampling policy belongs to SVDQuant smooth calibration. It is enabled for
+both calibrated zero-shot RTN and data-driven SignRound when SVDQuant smoothing
+is active. It must not change:
 
 - plain zero-shot RTN without smooth calibration;
-- SignRound or other data-driven compressors;
+- no-smooth SignRound or other data-driven compressors;
 - non-diffusion calibration behavior unless it explicitly opts into the same
   bounded-call contract;
 - diffusion output normalization used by existing loss-based algorithms;
 - Nunchaku export format or tensor metadata.
 
 The diffusion calibrator should expose a narrow optional call-selection hook or
-policy supplied by `CalibratedZeroShotCompressor`. It should not import or
-special-case the concrete SVDQuant transform.
+policy supplied by the selected compressor. It should not import or
+special-case the concrete SVDQuant transform. Both compressor paths reuse the
+same `smooth_max_calibration_calls` setting; no separate SignRound sampling
+option is introduced.
 
 ## Failure Handling
 
@@ -175,7 +180,9 @@ Unit tests must prove:
 6. Smooth groups retain no more than `K` projection and evaluation calls.
 7. Shared FLUX evaluation modules still share captured evaluation objects.
 8. FLUX dual-stream propagation remains correct.
-9. Plain RTN and SignRound routing remain unchanged.
+9. Smooth SignRound uses the same selected calls for smooth search and
+   SignRound optimization.
+10. Plain RTN and no-smooth SignRound routing remain unchanged.
 
 After focused CPU tests and Ruff pass, run a FLUX smoke calibration on physical
 GPU 1 with:

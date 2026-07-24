@@ -90,9 +90,11 @@ responsibilities:
 3. invoke the normal zero-shot RTN block quantizer for the residual;
 4. pass only the current block's FP reference output to the next block.
 
-No quantized block output is propagated. SignRound still uses `DataDrivenCompressor`
-because SignRound itself optimizes weights from calibration data. No-smooth RTN remains
-fully data-free and directly uses `ZeroShotCompressor`.
+No quantized block output is propagated in the terminal RTN path. SignRound still uses
+`DataDrivenCompressor` because it optimizes weights from calibration data. When SVDQuant
+smooth is enabled, the bounded selected calls form the shared smooth, residual output-error,
+and SignRound calibration pool. No-smooth SignRound keeps its original calibration behavior,
+and no-smooth RTN remains fully data-free and directly uses `ZeroShotCompressor`.
 
 The scheduler is streaming across each block group. It initially caches only the entry
 block inputs, not the inputs of all 57 FLUX blocks. After processing one block, its FP

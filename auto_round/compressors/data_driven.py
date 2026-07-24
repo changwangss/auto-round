@@ -26,6 +26,7 @@ from accelerate.utils import get_balanced_memory, get_max_memory
 from tqdm import tqdm
 
 from auto_round import envs
+from auto_round.calibration.sampling import uniform_call_indices
 from auto_round.calibration.utils import (
     _infer_last_cache_name,
     _split_inputs_diffusion,
@@ -93,6 +94,7 @@ class DataDrivenCompressor(BaseCompressor):
         if iters is None:
             iters = 200
         self.iters = iters
+        self._configure_svdquant_smooth_call_selection(config)
         super().__init__(
             config=config,
             model=model,
@@ -111,6 +113,45 @@ class DataDrivenCompressor(BaseCompressor):
         self.dataset = dataset
         if iters == 0:
             self.lr = 5e-3
+
+    def _configure_svdquant_smooth_call_selection(self, config: Union[object, list[object]]) -> None:
+        """Enable bounded shared calibration only for smooth SVDQuant pipelines."""
+        configs = config if isinstance(config, list) else [config]
+        self._smooth_max_calibration_calls = next(
+            (
+                candidate.smooth_max_calibration_calls
+                for candidate in configs
+                if getattr(candidate, "smooth_enabled", False)
+                and hasattr(candidate, "smooth_max_calibration_calls")
+            ),
+            None,
+        )
+        self._selected_calibration_call_indices = None
+        self._calibration_call_counts: dict[str, int] = {}
+
+    def prepare_calibration_call_selection(self, total_calls: int) -> None:
+        """Prepare the shared smooth/SignRound call sample before diffusion calibration."""
+        if self._smooth_max_calibration_calls is None:
+            self._selected_calibration_call_indices = None
+            self._calibration_call_counts = {}
+            return
+        selected = uniform_call_indices(total_calls, self._smooth_max_calibration_calls)
+        self._selected_calibration_call_indices = frozenset(selected)
+        self._calibration_call_counts = {}
+        logger.info(
+            "Retaining %d of %d diffusion transformer calls for shared SVDQuant smooth and SignRound calibration",
+            len(selected),
+            total_calls,
+        )
+
+    def should_cache_calibration_call(self, name: str) -> bool:
+        """Return whether this block invocation belongs to the configured shared sample."""
+        selected = self._selected_calibration_call_indices
+        if selected is None:
+            return True
+        call_index = self._calibration_call_counts.get(name, 0)
+        self._calibration_call_counts[name] = call_index + 1
+        return call_index in selected
 
     def post_init(self) -> None:
         """Run base post-init then attach the registered calibrator strategy.
