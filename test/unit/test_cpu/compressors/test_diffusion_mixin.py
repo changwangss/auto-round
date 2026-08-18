@@ -75,6 +75,51 @@ class TestFindAdditionalTransformers:
         assert len(result) == 1
         assert result[0][0] == "transformer_2"
 
+    def test_multi_transformer_quantize_uses_calibration_context_nsamples(self, monkeypatch):
+        class FakeParent:
+            @property
+            def model(self):
+                return self.model_context.model
+
+            def quantize(self):
+                return self.model_context.model, self.layer_config
+
+        class MockCompressor(DiffusionMixin, FakeParent):
+            def __init__(self):
+                primary = torch.nn.Linear(4, 4)
+                pipe = MagicMock()
+                pipe.components = {"transformer": None, "transformer_2": None}
+                pipe.transformer = primary
+                pipe.transformer_2 = torch.nn.Linear(4, 4)
+                self.model_context = SimpleNamespace(model=primary, pipe=pipe, quantized=False)
+                self.calibration_context = SimpleNamespace(nsamples=7)
+                self.compress_context = SimpleNamespace(low_cpu_mem_usage=False, is_immediate_saving=True)
+                self.quantizer = SimpleNamespace(quant_block_list=[["block"]], layer_config={})
+                self.quant_block_list = [["block"]]
+                self.layer_config = {}
+                self.need_calib = True
+                self.has_variable_block_shape = False
+                self.num_inference_steps = 2
+                self.cached_nsamples = []
+
+            def post_init(self):
+                pass
+
+            def _align_device_and_dtype_for_secondary(self, transformer_name):
+                pass
+
+            def try_cache_inter_data_gpucpu(self, block_names, nsamples, layer_names):
+                self.cached_nsamples.append(nsamples)
+                return {}
+
+        monkeypatch.setattr("auto_round.utils.get_block_names", lambda model: [["block"]])
+        monkeypatch.setattr("auto_round.utils.find_matching_blocks", lambda model, blocks, names: blocks)
+
+        comp = MockCompressor()
+        comp.quantize()
+
+        assert comp.cached_nsamples == [7, 7]
+
 
 class TestAlignDeviceAndDtype:
     """Test _align_device_and_dtype_for_secondary logic."""
