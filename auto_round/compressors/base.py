@@ -1933,9 +1933,17 @@ class BaseOrchestrator(object):
         if output_dir is not None:
             self.compress_context.output_dir = output_dir
         if format is not None:
-            if isinstance(format, str) and getattr(self, "formats", None) is None:
-                self.formats = self._resolve_format_string(format)
-                self.compress_context.formats = self.formats
+            # Explicit save-time selection takes precedence over initialization.
+            # DiffusionMixin passes resolved objects here so component tensors
+            # and the pipeline index must use that same selection.
+            if isinstance(format, str):
+                selected_formats = self._resolve_format_string(format)
+            elif isinstance(format, list) and format and all(isinstance(item, OutputFormat) for item in format):
+                selected_formats = list(format)
+            else:
+                raise TypeError("format must be a string or a non-empty list of OutputFormat objects")
+            self.formats = selected_formats
+            self.compress_context.formats = self.formats
 
         if not self.model_context.quantized:
             logger.warning("please run autoround.quantize first")

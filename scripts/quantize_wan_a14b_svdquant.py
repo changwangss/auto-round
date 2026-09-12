@@ -34,6 +34,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output", type=Path, required=True, help="New directory; existing paths are never overwritten"
     )
+    parser.add_argument("--format", choices=["svdquant_nunchaku", "svdquant_omni"], default="svdquant_nunchaku")
     parser.add_argument("--profile", choices=PROFILES, default="smoke")
     data = parser.add_mutually_exclusive_group()
     data.add_argument("--prompts-file", type=Path, help="UTF-8 text, one calibration prompt per nonempty line")
@@ -90,14 +91,19 @@ def validate_source(pipe):
             raise ValueError(f"{name} is not a Wan2.2 T2V A14B expert")
 
 
-def audit_export(output):
+def audit_export(output, format="svdquant_nunchaku"):
     import torch
     from safetensors import safe_open
 
     index = json.loads((output / "model_index.json").read_text())
     report = {}
     for name in ("transformer", "transformer_2"):
-        if index[name] != ["nunchaku", "NunchakuWanTransformer3DModel"]:
+        expected_class = (
+            ["diffusers", "WanTransformer3DModel"]
+            if format == "svdquant_omni"
+            else ["nunchaku", "NunchakuWanTransformer3DModel"]
+        )
+        if index[name] != expected_class:
             raise ValueError(f"Incorrect runtime class for {name}: {index[name]}")
         checkpoint = output / name / "diffusion_pytorch_model.safetensors"
         with safe_open(checkpoint, framework="pt", device="cpu") as handle:
@@ -179,11 +185,11 @@ def main(argv=None):
         guidance_scale=args.guidance_scale,
         generator_seed=args.seed,
         seed=args.seed,
-        format="svdquant_nunchaku",
+        format=args.format,
     )
     compressor.quantize()
-    compressor.save_quantized(str(args.output), format="svdquant_nunchaku")
-    report = audit_export(args.output)
+    compressor.save_quantized(str(args.output), format=args.format)
+    report = audit_export(args.output, args.format)
     report["seconds"] = time.monotonic() - start
     report["peak_cuda_allocated_gib"] = torch.cuda.max_memory_allocated(args.device) / 2**30
     (args.output / "export-audit.json").write_text(json.dumps(report, indent=2) + "\n")

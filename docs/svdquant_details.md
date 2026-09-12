@@ -305,3 +305,43 @@ image.save("sdxl-svdquant-mxfp4.png")
 - More residual iterations repeat decomposition and QDQ work.
 - A smoke image validates loading and numerical stability, not dataset-level
   generation quality.
+
+## Wan MXFP4 export for vLLM-Omni
+
+Use the explicit `svdquant_omni` format with the matching vLLM-Omni SVDQuant
+MXFP4 implementation. The default `svdquant_nunchaku` export stays available.
+Both Wan2.2 T2V A14B experts are exported; each requires all 400 projections.
+The saved pipeline keeps Diffusers classes and writes `quantization_config`
+into each transformer's `config.json` and `quantization_config.json`.
+
+```bash
+# Smooth + SignRound. Use representative prompts with the quality profile.
+python scripts/quantize_wan_a14b_svdquant.py \
+  --model /path/to/Wan2.2-T2V-A14B-Diffusers \
+  --output /path/to/new-wan-omni --format svdquant_omni --profile smoke
+
+# Data-free SVD decomposition and MXFP4 residual export.
+python scripts/quantize_wan_svdquant_nunchaku.py \
+  --model /path/to/Wan2.2-T2V-A14B-Diffusers \
+  --output /path/to/new-wan-omni-rtn --format svdquant_omni --devices cuda:0
+
+# Existing Nunchaku pipeline, component directory, or single expert onefile.
+python scripts/convert_wan_svdquant_omni.py \
+  --source /path/to/wan-nunchaku --output /path/to/new-wan-omni-converted
+```
+
+Conversion reverses physical integer permutations without reconstructing or
+requantizing weights. It requires the original checkpoint's Wan config and MXFP4
+metadata. The output directory must be new. Auxiliary safetensors may share disk
+storage through hardlinks; JSON configurations are independent copies. A single
+expert input produces a component directory, not a complete two-expert pipeline.
+
+Canonical tensors use independent self-attention Q/K/V (`fuse_qkv=false`), ordinary
+Diffusers projection names, low-first E2M1 nibble bytes in `qweight: int8[N,K/2]`,
+and raw UE8M0 bytes in `wscales: uint8[K/32,N]`. With AutoRound smoothing `s`,
+`proj_down: BF16[K,R]` is `(lora_down * s).T`, `proj_up: BF16[N,R]` is `lora_up`,
+and `smooth_factor: BF16[K]` is `1/s`. Runtime smoothing divides only the residual
+input; the low-rank branch uses the original input. Bias is added once. Protected
+FP32 parameters retain FP32 storage. The exporter rejects non-finite BF16 results
+and nonpositive smoothing factors. This format does not import Nunchaku or vLLM;
+actual GPU kernel and full-model validation must use the matching Omni checkout.

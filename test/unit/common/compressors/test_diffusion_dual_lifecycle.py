@@ -226,7 +226,7 @@ def saved_comp(comp, monkeypatch):
     return comp
 
 
-@pytest.mark.parametrize("format_name", ["svdquant_nunchaku", "auto_round"])
+@pytest.mark.parametrize("format_name", ["svdquant_nunchaku", "svdquant_omni", "auto_round"])
 @pytest.mark.parametrize("adapter", ["NunchakuWanTransformer3DModel", "NunchakuFluxTransformer2dModel"])
 def test_save_index_uses_actual_wan_nunchaku_export_only(saved_comp, tmp_path, format_name, adapter):
     comp = saved_comp

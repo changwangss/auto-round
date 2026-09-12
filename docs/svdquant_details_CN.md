@@ -294,3 +294,40 @@ image.save("sdxl-svdquant-mxfp4.png")
 - Smooth 搜索会针对每组 Alpha/Beta 候选重放所有保留 calls。
 - 增加 residual iterations 会重复执行分解和 QDQ。
 - Smoke 图片只能验证加载和数值稳定性，不能代替数据集级的生成质量评估。
+
+## 面向 vLLM-Omni 的 Wan MXFP4 导出
+
+使用显式格式 `svdquant_omni`，并搭配支持 SVDQuant MXFP4 的对应 vLLM-Omni
+实现。默认 `svdquant_nunchaku` 格式继续保留。Wan2.2 T2V A14B 的两个专家分别
+导出，每个专家必须包含完整的 400 个投影。流水线保留 Diffusers 类名，并在每个
+transformer 的 `config.json` 和 `quantization_config.json` 中保存量化配置。
+
+```bash
+# Smooth + SignRound；quality 配置需要代表性提示词。
+python scripts/quantize_wan_a14b_svdquant.py \
+  --model /path/to/Wan2.2-T2V-A14B-Diffusers \
+  --output /path/to/new-wan-omni --format svdquant_omni --profile smoke
+
+# 无校准数据的 SVD 分解与 MXFP4 残差导出。
+python scripts/quantize_wan_svdquant_nunchaku.py \
+  --model /path/to/Wan2.2-T2V-A14B-Diffusers \
+  --output /path/to/new-wan-omni-rtn --format svdquant_omni --devices cuda:0
+
+# 转换现有 Nunchaku 流水线、组件目录或单个专家 onefile。
+python scripts/convert_wan_svdquant_omni.py \
+  --source /path/to/wan-nunchaku --output /path/to/new-wan-omni-converted
+```
+
+转换只反转整数物理排列，不重建浮点权重，也不重新量化。源检查点必须提供原始
+Wan 配置和 MXFP4 元数据，输出必须是新目录。辅助 safetensors 可以使用硬链接
+共享磁盘空间，JSON 配置始终独立复制。单个专家输入只生成组件目录，不代表完整
+的双专家流水线。
+
+规范布局保留独立自注意力 Q/K/V（`fuse_qkv=false`）和普通 Diffusers 投影名。
+`qweight: int8[N,K/2]` 使用低半字节优先的 E2M1 编码，
+`wscales: uint8[K/32,N]` 保存原始 UE8M0 字节。若 AutoRound 平滑向量为 `s`，
+则 `proj_down: BF16[K,R]` 为 `(lora_down * s).T`，`proj_up: BF16[N,R]`
+为 `lora_up`，`smooth_factor: BF16[K]` 为 `1/s`。运行时仅残差输入除以平滑
+因子，低秩分支使用原始输入，偏置仅加一次。声明保留 FP32 的参数维持 FP32 存储。
+导出器拒绝 BF16 转换后的非有限数值和非正平滑因子。该格式不导入 Nunchaku 或
+vLLM；实际 GPU 内核和完整模型验证需要使用配套 Omni 工作区。

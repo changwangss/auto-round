@@ -164,6 +164,8 @@ def _decompose_blocks(
 
 
 def _prepare_pipeline(source: Path, output: Path) -> None:
+    from auto_round.export.svdquant_omni import _copy_asset
+
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -172,11 +174,11 @@ def _prepare_pipeline(source: Path, output: Path) -> None:
             continue
         destination = output / item.name
         if item.is_dir():
-            shutil.copytree(item, destination, copy_function=os.link, dirs_exist_ok=True)
+            shutil.copytree(item, destination, copy_function=_copy_asset, dirs_exist_ok=True)
         elif item.name == "model_index.json":
             shutil.copy2(item, destination)
         else:
-            os.link(item, destination)
+            _copy_asset(item, destination)
 
 
 def _quantize_component(
@@ -186,6 +188,7 @@ def _quantize_component(
     rank: int,
     residual_iters: int,
     devices: tuple[torch.device, ...],
+    format: str = "svdquant_nunchaku",
 ) -> None:
     print(f"loading {source}", flush=True)
     model = WanTransformer3DModel.from_pretrained(
@@ -200,13 +203,18 @@ def _quantize_component(
     temporary = output / ".diffusion_pytorch_model.tmp.safetensors"
     adapter = WanSVDQuantNunchakuAdapter(config=dict(model.config), require_complete_model=True)
     try:
-        save_svdquant_nunchaku_safetensors(
-            model,
-            os.fspath(temporary),
-            config=SVDQuantExportConfig(runtime_loadable=True),
-            adapter=adapter,
-        )
-        os.replace(temporary, output / "diffusion_pytorch_model.safetensors")
+        if format == "svdquant_omni":
+            from auto_round.export.svdquant_omni import save_svdquant_omni
+
+            save_svdquant_omni(model, output)
+        else:
+            save_svdquant_nunchaku_safetensors(
+                model,
+                os.fspath(temporary),
+                config=SVDQuantExportConfig(runtime_loadable=True),
+                adapter=adapter,
+            )
+            os.replace(temporary, output / "diffusion_pytorch_model.safetensors")
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -222,6 +230,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True, help="Wan2.2 Diffusers pipeline directory.")
     parser.add_argument("--output", type=Path, required=True, help="Output Diffusers/Nunchaku pipeline directory.")
+    parser.add_argument("--format", choices=["svdquant_nunchaku", "svdquant_omni"], default="svdquant_nunchaku")
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--residual-iters", type=int, default=1)
     parser.add_argument(
@@ -243,17 +252,22 @@ def main() -> None:
             rank=args.rank,
             residual_iters=args.residual_iters,
             devices=devices,
+            format=args.format,
         )
 
     model_index_path = args.output / "model_index.json"
     with model_index_path.open(encoding="utf-8") as handle:
         model_index = json.load(handle)
     for component in ("transformer", "transformer_2"):
-        model_index[component] = ["nunchaku", "NunchakuWanTransformer3DModel"]
+        model_index[component] = (
+            ["diffusers", "WanTransformer3DModel"]
+            if args.format == "svdquant_omni"
+            else ["nunchaku", "NunchakuWanTransformer3DModel"]
+        )
     with model_index_path.open("w", encoding="utf-8") as handle:
         json.dump(model_index, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    print(f"saved Nunchaku Wan2.2 pipeline to {args.output}", flush=True)
+    print(f"saved {args.format} Wan2.2 pipeline to {args.output}", flush=True)
 
 
 if __name__ == "__main__":
