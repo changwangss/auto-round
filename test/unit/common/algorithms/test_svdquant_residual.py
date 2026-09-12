@@ -83,6 +83,35 @@ def test_truncated_svd_returns_shared_down_factor_for_stacked_projection_group()
     torch.testing.assert_close(torch.cat((q_up @ down, k_up @ down, v_up @ down)), low_rank)
 
 
+def test_truncated_svd_uses_default_driver_on_cpu(monkeypatch):
+    original_svd = torch.linalg.svd
+    calls = []
+
+    def record_svd(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return original_svd(*args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "svd", record_svd)
+    truncated_svd(torch.randn(8, 4), rank=2)
+
+    assert calls == [{"full_matrices": False}]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the gesvda driver")
+def test_truncated_svd_uses_gesvda_driver_on_cuda(monkeypatch):
+    original_svd = torch.linalg.svd
+    calls = []
+
+    def record_svd(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return original_svd(*args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "svd", record_svd)
+    truncated_svd(torch.randn(8, 4, device="cuda"), rank=2)
+
+    assert calls == [{"full_matrices": False, "driver": "gesvda"}]
+
+
 def test_residual_iteration_keeps_the_best_materialized_candidate():
     torch.manual_seed(1)
     weight = torch.randn(8, 32, dtype=torch.float32)

@@ -30,6 +30,7 @@ from auto_round.data_type.utils import get_quant_func
 
 _FIXED_MXFP4_DTYPES = frozenset({"mx_fp4", "mx_fp4e2m1"})
 _MXFP4_ALIASES = frozenset({"mx_fp", *_FIXED_MXFP4_DTYPES})
+_CUDA_SVD_DRIVER = "gesvda"
 
 
 def _validate_scheme_values(scheme):
@@ -181,7 +182,8 @@ def truncated_svd(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.
         up_weight = torch.empty((out_features, 0), dtype=weight.dtype, device=weight.device)
         return low_rank, down_weight, up_weight
 
-    u, s, vh = torch.linalg.svd(weight, full_matrices=False)
+    svd_kwargs = {"driver": _CUDA_SVD_DRIVER} if weight.is_cuda else {}
+    u, s, vh = torch.linalg.svd(weight, full_matrices=False, **svd_kwargs)
     down_weight = vh[:rank, :]
     up_weight = u[:, :rank] * s[:rank].reshape(1, -1)
     return up_weight @ down_weight, down_weight, up_weight
