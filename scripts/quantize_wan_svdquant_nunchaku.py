@@ -36,7 +36,31 @@ from auto_round.algorithms.transforms.svdquant import SVDQuantConfig
 from auto_round.algorithms.transforms.svdquant.apply import SVDQuantTransform
 from auto_round.algorithms.transforms.svdquant.smooth_adapters.base import SmoothSearchGroup
 from auto_round.export.svdquant_adapters.wan import WAN_SVDQUANT_TARGET_MODULES, WanSVDQuantNunchakuAdapter
-from auto_round.export.svdquant_nunchaku import SVDQuantExportConfig, save_svdquant_nunchaku_safetensors
+from auto_round.export.svdquant_nunchaku import (
+    MXFP4ResidualTensorProvider,
+    SVDQuantExportConfig,
+    save_svdquant_nunchaku_safetensors,
+)
+
+
+class _ProgressResidualTensorProvider:
+    """Report progress during the otherwise silent, CPU-heavy MXFP4 packing stage."""
+
+    def __init__(self, total: int) -> None:
+        self._provider = MXFP4ResidualTensorProvider()
+        self._total = total
+        self._completed = 0
+
+    def tensors_for(self, record):
+        started = time.time()
+        payload = self._provider.tensors_for(record)
+        self._completed += 1
+        print(
+            f"packed MXFP4 projection {self._completed}/{self._total} ({record.prefix}) "
+            f"in {time.time() - started:.2f}s",
+            flush=True,
+        )
+        return payload
 
 
 def _set_mxfp4_scheme(module: torch.nn.Linear) -> None:
@@ -195,26 +219,30 @@ def _quantize_component(
         source,
         torch_dtype=torch.bfloat16,
         local_files_only=True,
-        low_cpu_mem_usage=True,
+        #low_cpu_mem_usage=True,
     )
     _decompose_blocks(model, rank, devices, residual_iters)
     output.mkdir(parents=True, exist_ok=True)
     model.save_config(output)
     temporary = output / ".diffusion_pytorch_model.tmp.safetensors"
     adapter = WanSVDQuantNunchakuAdapter(config=dict(model.config), require_complete_model=True)
+    residual_provider = _ProgressResidualTensorProvider(len(model.blocks) * len(WAN_SVDQUANT_TARGET_MODULES))
+    print(f"packing and exporting {source.name} as {format}", flush=True)
     try:
         if format == "svdquant_omni":
             from auto_round.export.svdquant_omni import save_svdquant_omni
 
-            save_svdquant_omni(model, output)
+            save_svdquant_omni(model, output, residual_provider=residual_provider)
         else:
             save_svdquant_nunchaku_safetensors(
                 model,
                 os.fspath(temporary),
                 config=SVDQuantExportConfig(runtime_loadable=True),
+                residual_provider=residual_provider,
                 adapter=adapter,
             )
             os.replace(temporary, output / "diffusion_pytorch_model.safetensors")
+        print(f"finished exporting {source.name}", flush=True)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
